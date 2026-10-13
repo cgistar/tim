@@ -1,0 +1,21 @@
+# OS
+.DS_Store
+Thumbs.db
+
+#AI
+.agents
+.claude
+.codex
+.trellis
+grill-sessions/*.md
+AGENTS.md
+.gitattributes
+
+# Go
+.gocache
+.gomodcache
+
+
+/dist/
+/data/
+**/*_test.go
