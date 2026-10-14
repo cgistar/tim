@@ -30,6 +30,9 @@ func configureForm(form *tview.Form) {
 		case *tview.InputField:
 			item.SetPlaceholderStyle(tcell.StyleDefault.Foreground(tcell.ColorGray))
 			item.SetInputCapture(formArrowNavigation)
+		case *tview.DropDown:
+			item.SetFocusedStyle(controlFocusStyle())
+			item.SetListStyles(tcell.StyleDefault, controlFocusStyle())
 		}
 	}
 	for i := 0; i < form.GetButtonCount(); i++ {

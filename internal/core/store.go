@@ -1,9 +1,7 @@
 package core
 
 import (
-	"encoding/json"
 	"errors"
-	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -11,13 +9,13 @@ import (
 )
 
 type Active struct {
-	Runtime string `json:"runtime"`
+	Runtime string
 }
 type Process struct {
-	PID     int    `json:"pid"`
-	Start   string `json:"start"`
-	Binary  string `json:"binary"`
-	Runtime string `json:"runtime"`
+	PID     int
+	Start   string
+	Binary  string
+	Runtime string
 }
 type Store struct {
 	ConfigDir    string
@@ -41,6 +39,19 @@ func (s *Store) Kernel() (string, error) {
 		return "", err
 	}
 	return resolveBinary(s.ResolvePath(settings.MihomoPath))
+}
+
+// 仅文件缺失触发下载提示；权限或配置错误仍交给原错误处理。
+func (s *Store) KernelMissing() (bool, error) {
+	settings, err := s.Settings()
+	if err != nil {
+		return false, err
+	}
+	_, err = os.Stat(s.ResolvePath(settings.MihomoPath))
+	if errors.Is(err, os.ErrNotExist) {
+		return true, nil
+	}
+	return false, err
 }
 
 func (s *Store) ResolvePath(path string) string {
@@ -80,7 +91,7 @@ func Open(dir string) (*Store, error) {
 	if err = s.setInitialDataDir(s.effectiveDataDir(settings)); err != nil {
 		return nil, err
 	}
-	if err = s.initializeState(); err != nil {
+	if err = s.removeObsoleteState(); err != nil {
 		return nil, err
 	}
 	return s, nil
@@ -132,23 +143,6 @@ func AtomicWrite(path string, b []byte, mode os.FileMode) error {
 	}
 	return os.Rename(name, path)
 }
-func writeJSON(path string, v any) error {
-	b, err := json.MarshalIndent(v, "", "  ")
-	if err != nil {
-		return err
-	}
-	return AtomicWrite(path, b, 0600)
-}
-func readJSON(path string, v any) error {
-	b, err := os.ReadFile(path)
-	if err != nil {
-		return err
-	}
-	if err = json.Unmarshal(b, v); err != nil {
-		return fmt.Errorf("读取 %s: %w", filepath.Base(path), err)
-	}
-	return nil
-}
 func (s *Store) Settings() (Settings, error) {
 	b, err := os.ReadFile(s.Path("setting.yaml"))
 	if err != nil {
@@ -157,12 +151,15 @@ func (s *Store) Settings() (Settings, error) {
 	return ParseSettings(b)
 }
 func (s *Store) Active() (Active, error) {
-	state, err := s.State()
-	v := Active{}
-	if state.Applied {
-		v.Runtime = s.Path("config.yaml")
+	path := s.Path("config.yaml")
+	_, err := os.Stat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return Active{}, nil
 	}
-	return v, err
+	if err != nil {
+		return Active{}, err
+	}
+	return Active{Runtime: path}, nil
 }
 func (s *Store) User() (*Document, error) {
 	b, err := os.ReadFile(s.Path("user.yaml"))
@@ -174,25 +171,19 @@ func (s *Store) User() (*Document, error) {
 	}
 	return ParseUser(b)
 }
-func (s *Store) Base() (*Document, error) {
-	b, err := os.ReadFile(s.Path("subscription.yaml"))
-	if err != nil {
-		return nil, fmt.Errorf("请先下载有效订阅: %w", err)
+
+// 旧状态不再参与身份判断；清理仅限当前数据目录的已废弃文件。
+func (s *Store) removeObsoleteState() error {
+	if runtime.GOOS == "linux" && s.DataDir() != s.ConfigDir {
+		unlock, err := lockFile(filepath.Join(s.DataDir(), "operation.lock"))
+		if err != nil {
+			return err
+		}
+		defer unlock()
 	}
-	return Parse(b)
-}
-func (s *Store) Preview() (*Document, []string, error) {
-	base, err := s.Base()
-	if err != nil {
-		return nil, nil, err
+	err := os.Remove(s.Path("state.json"))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
 	}
-	u, err := s.User()
-	if err != nil {
-		return nil, nil, err
-	}
-	settings, err := s.Settings()
-	if err != nil {
-		return nil, nil, err
-	}
-	return BuildConfigured(base, u, settings)
+	return err
 }

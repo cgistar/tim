@@ -22,8 +22,7 @@ func DefaultSettings() (Settings, error) {
 	d, err := Parse([]byte(`mixed-port: 7890
 port: 0
 socks-port: 0
-bind-address: 127.0.0.1
-allow-lan: false
+allow-lan: true
 external-controller: 0.0.0.0:9090
 secret: ""
 external-ui: ui
@@ -62,7 +61,7 @@ dns:
   default-nameserver: [223.5.5.5, 119.29.29.29]
   nameserver: ["https://1.1.1.1/dns-query"]
   proxy-server-nameserver: ["https://doh.pub/dns-query#DIRECT", "https://dns.alidns.com/dns-query#DIRECT"]
-  direct-nameserver: [system, "https://dns.alidns.com/dns-query", "https://doh.pub/dns-query"]
+  direct-nameserver: ["https://dns.alidns.com/dns-query", "https://doh.pub/dns-query"]
 hosts:
   dns.alidns.com: [223.5.5.5, 223.6.6.6]
   doh.pub: [1.12.12.12, 120.53.53.53]
@@ -134,7 +133,9 @@ func (s Settings) Bytes() ([]byte, error) {
 	if s.Config == nil {
 		return nil, fmt.Errorf("setting.yaml 缺少 config")
 	}
-	put(d.Root.Content[0], "config", cloneNode(s.Config.Root.Content[0]))
+	config := s.Config.Clone()
+	config.Delete("bind-address")
+	put(d.Root.Content[0], "config", cloneNode(config.Root.Content[0]))
 	formatSettingsNode(&d.Root)
 	return d.Bytes()
 }
@@ -161,6 +162,7 @@ func ParseSettings(raw []byte) (Settings, error) {
 		}
 	}
 	config := &Document{Root: yaml.Node{Kind: yaml.DocumentNode, Content: []*yaml.Node{cloneNode(d.Get("config"))}}}
+	config.Delete("bind-address")
 	s := Settings{DataDir: d.Text("data-dir"), MihomoPath: d.Text("mihomo-path"), URL: d.Text("subscription_url"), FakeIP: d.Text("fake-ip-enabled") == "true", Config: config}
 	if n := d.Get("delay-test-url"); n != nil {
 		if n.Tag != "!!str" {
@@ -263,6 +265,14 @@ func (s Settings) Automatic() (*Document, error) {
 		return nil, err
 	}
 	d := s.Config.Clone()
+	// 代理监听地址由局域网开关派生，不保留独立管理值。
+	bindAddress := "127.0.0.1"
+	if s.Config.Text("allow-lan") == "true" {
+		bindAddress = "0.0.0.0"
+	}
+	if err := d.Set(bindAddress, "bind-address"); err != nil {
+		return nil, err
+	}
 	if err := d.Set("fake-ip", "dns", "enhanced-mode"); err != nil {
 		return nil, err
 	}
@@ -275,22 +285,6 @@ func (s Settings) Automatic() (*Document, error) {
 		}
 	}
 	return d, nil
-}
-func BuildConfigured(base, user *Document, settings Settings) (*Document, []string, error) {
-	auto, err := settings.Automatic()
-	if err != nil {
-		return nil, nil, err
-	}
-	b := base.Clone()
-	// DNS 由管理配置完整定义，避免订阅中的策略、fallback 等隐式混入默认模板。
-	b.Delete("dns")
-	merge(b.Root.Content[0], auto.Root.Content[0])
-	cfg, warnings, err := Build(b, user)
-	if err != nil {
-		return nil, nil, err
-	}
-	warnings = append(warnings, OverrideWarnings(auto, user)...)
-	return cfg, append(warnings, applyChain(cfg, settings.Chain)...), nil
 }
 
 // 只提示不同于自动配置的自定义值，不把静态配置关系表述为刚执行的操作。
@@ -314,7 +308,7 @@ func OverrideWarnings(auto, user *Document) []string {
 			warnings = append(warnings, fmt.Sprintf("%s 使用 user.yaml 中的值：%s", key, displayNode(u)))
 		}
 	}
-	visit(auto.Root.Content[0], user.Root.Content[0], nil)
+	visit(auto.Root.Content[0], userOverrides(user).Root.Content[0], nil)
 	return warnings
 }
 

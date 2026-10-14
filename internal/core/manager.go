@@ -2,12 +2,10 @@ package core
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -62,16 +60,7 @@ func (m *Manager) locked(fn func() error) error {
 	return fn()
 }
 func (m *Manager) process() (Process, bool, error) {
-	state, err := m.Store.State()
-	if err != nil {
-		return Process{}, false, err
-	}
-	if state.Process == nil {
-		return Process{}, false, nil
-	}
-	p := *state.Process
-	ok, err := matchesProcess(p)
-	return p, ok, err
+	return discoverProcess(m.Store.Path("config.yaml"), m.Store.Path("home"))
 }
 func (m *Manager) Status(ctx context.Context) (Status, error) {
 	p, live, err := m.process()
@@ -143,115 +132,6 @@ func Version(ctx context.Context, binary string) (string, error) {
 		return "", fmt.Errorf("可执行文件不是 mihomo")
 	}
 	return v, nil
-}
-func (m *Manager) SaveSettings(v Settings) error {
-	return m.locked(func() error {
-		if v.URL != "" {
-			if err := validateURL(v.URL); err != nil {
-				return err
-			}
-		}
-		current, err := m.Store.Settings()
-		if err != nil {
-			return err
-		}
-		current.URL = v.URL
-		raw, err := current.Bytes()
-		if err != nil {
-			return err
-		}
-		return AtomicWrite(m.Store.Path("setting.yaml"), raw, 0600)
-	})
-}
-func validateURL(raw string) error {
-	u, err := url.Parse(raw)
-	if err != nil || u.Host == "" || (u.Scheme != "https" && u.Scheme != "http") || u.User != nil {
-		return fmt.Errorf("订阅地址必须是有效 HTTP(S) URL，不支持 URL 用户认证")
-	}
-	return nil
-}
-func readBounded(r io.Reader, limit int64) ([]byte, error) {
-	b, err := io.ReadAll(io.LimitReader(r, limit+1))
-	if err != nil {
-		return nil, err
-	}
-	if int64(len(b)) > limit {
-		return nil, fmt.Errorf("响应超过 %d 字节限制", limit)
-	}
-	return b, nil
-}
-func (m *Manager) Refresh(ctx context.Context) error {
-	return m.locked(func() error {
-		s, err := m.Store.Settings()
-		if err != nil {
-			return err
-		}
-		return m.refresh(ctx, s)
-	})
-}
-
-// 新订阅校验并应用成功后，才同时提交地址和订阅缓存。
-func (m *Manager) RefreshURL(ctx context.Context, rawURL string) error {
-	return m.locked(func() error {
-		s, err := m.Store.Settings()
-		if err != nil {
-			return err
-		}
-		s.URL = rawURL
-		return m.refresh(ctx, s)
-	})
-}
-
-func (m *Manager) refresh(ctx context.Context, s Settings) error {
-	if err := validateURL(s.URL); err != nil {
-		return err
-	}
-	req, err := http.NewRequestWithContext(ctx, "GET", s.URL, nil)
-	if err != nil {
-		return err
-	}
-	req.Header.Set("User-Agent", "tim/1.0")
-	started := time.Now()
-	res, err := m.HTTP.Do(req)
-	if err != nil {
-		if errors.Is(err, context.DeadlineExceeded) {
-			return fmt.Errorf("订阅下载超时（已等待 %s，原缓存保留）：订阅服务或上游未在期限内完成响应: %w", time.Since(started).Round(time.Second), safeNetworkError(err))
-		}
-		return fmt.Errorf("订阅下载失败（原缓存保留）: %w", safeNetworkError(err))
-	}
-	defer res.Body.Close()
-	if res.StatusCode != 200 {
-		return fmt.Errorf("订阅返回 HTTP %d，原缓存保留", res.StatusCode)
-	}
-	b, err := readBounded(res.Body, 8<<20)
-	if err != nil {
-		return err
-	}
-	base, err := Parse(b)
-	if err != nil {
-		return err
-	}
-	u, err := m.Store.User()
-	if err != nil {
-		return err
-	}
-	_, live, err := m.process()
-	if err != nil {
-		return err
-	}
-	return m.apply(ctx, base, u, s, live)
-}
-
-func safeNetworkError(err error) error {
-	var u *url.Error
-	if errors.As(err, &u) {
-		return u.Err
-	}
-	return err
-}
-func (m *Manager) Candidate() (*Document, error) { return m.Store.Base() }
-func (m *Manager) Preview() (*Document, []string, error) {
-	return m.Store.Preview()
 }
 
 // 保存只更新管理文件；应用运行配置由独立操作执行。
@@ -453,7 +333,7 @@ func (m *Manager) Start(ctx context.Context) error {
 			return err
 		}
 		if live {
-			return fmt.Errorf("mihomo 已运行")
+			return nil
 		}
 		u, err := m.Store.User()
 		if err != nil {
@@ -523,112 +403,9 @@ func (m *Manager) ToggleMode(ctx context.Context, mode string) error {
 }
 func (m *Manager) ToggleTun(ctx context.Context, enabled bool) error {
 	if enabled && os.Geteuid() != 0 {
-		return fmt.Errorf("TUN 管理需要 sudo/root，请在同一启动目录重新运行 TUI")
+		return fmt.Errorf("TUN 管理需要 sudo/root，请以管理员身份重新运行同一个 tim 程序")
 	}
 	return m.setManaged(ctx, enabled, "tun", "enable")
-}
-func (m *Manager) apply(ctx context.Context, base, user *Document, settings Settings, start bool) error {
-	cfg, _, err := BuildConfigured(base, user, settings)
-	if err != nil {
-		return err
-	}
-	binary, err := resolveBinary(m.Store.ResolvePath(settings.MihomoPath))
-	if err != nil {
-		return err
-	}
-	if cfg.Text("tun", "enable") == "true" && start && os.Geteuid() != 0 {
-		return fmt.Errorf("启用 TUN 需要 sudo/root")
-	}
-	if cfg, err = m.validateWithChain(ctx, binary, cfg, base, user, settings); err != nil {
-		return err
-	}
-	raw, err := cfg.Bytes()
-	if err != nil {
-		return err
-	}
-	runtimePath := m.Store.Path("config.yaml")
-	previous, readErr := os.ReadFile(runtimePath)
-	if readErr != nil && !errors.Is(readErr, os.ErrNotExist) {
-		return readErr
-	}
-	old, live, err := m.process()
-	if err != nil {
-		return err
-	}
-	if live {
-		if err = m.stop(ctx); err != nil {
-			return err
-		}
-	}
-	rollback := func(cause error) error {
-		rollbackCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		if _, running, e := m.process(); e != nil {
-			return fmt.Errorf("应用失败: %w；无法确认新进程状态: %v", cause, e)
-		} else if running {
-			if e = m.stop(rollbackCtx); e != nil {
-				return fmt.Errorf("应用失败: %w；停止新进程失败: %v", cause, e)
-			}
-		}
-		if e := m.stop(rollbackCtx); e != nil {
-			return fmt.Errorf("应用失败: %w；清理进程状态失败: %v", cause, e)
-		}
-		var restoreErr error
-		if readErr == nil {
-			restoreErr = AtomicWrite(runtimePath, previous, 0600)
-		} else {
-			restoreErr = os.Remove(runtimePath)
-			if errors.Is(restoreErr, os.ErrNotExist) {
-				restoreErr = nil
-			}
-		}
-		if restoreErr != nil {
-			return fmt.Errorf("应用失败: %w；恢复 config.yaml 失败: %v", cause, restoreErr)
-		}
-		if live {
-			if e := m.launch(rollbackCtx, old.Binary, runtimePath); e != nil {
-				return fmt.Errorf("应用失败: %w；旧配置恢复失败: %v", cause, e)
-			}
-			return fmt.Errorf("应用失败，已恢复旧运行配置: %w", cause)
-		}
-		return cause
-	}
-	if err = AtomicWrite(runtimePath, raw, 0600); err != nil {
-		return rollback(err)
-	}
-	if start {
-		if err = m.launch(ctx, binary, runtimePath); err != nil {
-			return rollback(err)
-		}
-	}
-	// 提交前保存原始文件，提交失败同样恢复文件和运行实例。
-	userBytes, err := user.UserBytes()
-	if err != nil {
-		return rollback(err)
-	}
-	baseBytes, err := base.Bytes()
-	if err != nil {
-		return rollback(err)
-	}
-	sb, err := settings.Bytes()
-	if err != nil {
-		return rollback(err)
-	}
-	state, err := m.Store.State()
-	if err != nil {
-		return rollback(err)
-	}
-	state.Applied = true
-	ab, err := jsonBytes(state)
-	if err != nil {
-		return rollback(err)
-	}
-	writes := []fileWrite{{"user.yaml", userBytes}, {"subscription.yaml", baseBytes}, {"setting.yaml", sb}, {"state.json", ab}}
-	if err = commitFiles(m.Store, writes); err != nil {
-		return rollback(err)
-	}
-
-	return nil
 }
 
 type fileWrite struct {
@@ -636,7 +413,6 @@ type fileWrite struct {
 	data []byte
 }
 
-func jsonBytes(v any) ([]byte, error) { return json.MarshalIndent(v, "", "  ") }
 func commitFiles(s *Store, writes []fileWrite) error {
 	old := make([][]byte, len(writes))
 	exists := make([]bool, len(writes))
@@ -687,13 +463,6 @@ func (m *Manager) stop(ctx context.Context) error {
 		return err
 	}
 	if !live {
-		state, e := m.Store.State()
-		if e != nil {
-			return e
-		}
-		if state.Process != nil {
-			return m.Store.saveProcess(nil)
-		}
 		return nil
 	}
 	if err = signalManaged(p); err != nil {
@@ -711,13 +480,13 @@ func (m *Manager) stop(ctx context.Context) error {
 			return err
 		}
 		if !ok {
-			return m.Store.saveProcess(nil)
+			return nil
 		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-timer.C:
-			return fmt.Errorf("mihomo 未在 12 秒内退出，保留进程记录；未强杀")
+			return fmt.Errorf("mihomo 未在 12 秒内退出，未强杀")
 		case <-tick.C:
 		}
 	}
@@ -765,10 +534,6 @@ func (m *Manager) launch(ctx context.Context, binary, path string) error {
 	}
 	if p.PID == 0 {
 		return fmt.Errorf("mihomo 启动后立即退出，请查看日志")
-	}
-	if err = m.Store.saveProcess(&p); err != nil {
-		_ = signalManaged(p)
-		return err
 	}
 	readyCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()

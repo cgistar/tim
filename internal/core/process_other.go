@@ -15,3 +15,4 @@ func detach(*exec.Cmd)                                      {}
 func processIdentity(int) (string, string, []string, error) { return "", "", nil, supported() }
 func matchesProcess(Process) (bool, error)                  { return false, supported() }
 func signalManaged(Process) error                           { return supported() }
+func discoverProcess(string, string) (Process, bool, error) { return Process{}, false, nil }

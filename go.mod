@@ -1,4 +1,4 @@
-module clisimplehub/tui
+module tim
 
 go 1.26
 

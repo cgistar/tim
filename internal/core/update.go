@@ -149,6 +149,20 @@ func (m *Manager) Update(ctx context.Context) error {
 		return m.updateWithClient(ctx, client)
 	})
 }
+
+// 首次安装不能依赖尚未存在的代理内核，明确使用当前网络下载。
+func (m *Manager) InstallKernel(ctx context.Context) error {
+	return m.locked(func() error {
+		missing, err := m.Store.KernelMissing()
+		if err != nil {
+			return err
+		}
+		if !missing {
+			return fmt.Errorf("配置的内核已存在，请使用内核更新")
+		}
+		return m.updateWithClient(ctx, m.HTTP)
+	})
+}
 func (m *Manager) updateWithClient(ctx context.Context, client *http.Client) error {
 	r, err := latestRelease(ctx, client)
 	if err != nil {

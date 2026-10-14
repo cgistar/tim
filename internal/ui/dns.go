@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"strings"
 
-	"clisimplehub/tui/internal/core"
+	"tim/internal/core"
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
 )

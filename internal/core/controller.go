@@ -92,17 +92,18 @@ func (c *Controller) Check(ctx context.Context, d *Document) (RuntimeInfo, strin
 	if info.Tun.Enable != tun {
 		return info, "", fmt.Errorf("TUN 实际状态与配置不符")
 	}
+	if info.Mode != "global" {
+		return info, "", nil
+	}
 	g, err := c.Global(ctx)
-	if err != nil && info.Mode == "global" {
+	if err != nil {
 		return info, "", err
 	}
-	if info.Mode == "global" {
-		if len(g.All) == 0 || g.Now == "COMPATIBLE" || g.Now == "" {
-			return info, g.Now, fmt.Errorf("GLOBAL 尚无实际代理节点")
-		}
-		if !contains(g.All, g.Now) {
-			return info, g.Now, fmt.Errorf("GLOBAL 当前选择不在候选列表")
-		}
+	if len(g.All) == 0 || g.Now == "COMPATIBLE" || g.Now == "" {
+		return info, g.Now, fmt.Errorf("GLOBAL 尚无实际代理节点")
+	}
+	if !contains(g.All, g.Now) {
+		return info, g.Now, fmt.Errorf("GLOBAL 当前选择不在候选列表")
 	}
 	return info, g.Now, nil
 }

@@ -275,7 +275,7 @@ func applyChain(d *Document, settings ChainSettings) []string {
 		setChainRuntime(d, ChainRuntime{Reason: "没有可用代理出口"})
 		return []string{"链式前置未生效：没有可用代理出口"}
 	}
-	// GLOBAL 已生成；自动收录节点的组还需排除此独立前置，避免成为普通出口候选。
+	// 自动收录节点的组需排除此独立前置，避免成为普通出口候选。
 	if groups := d.Get("proxy-groups"); groups != nil {
 		for _, group := range groups.Content {
 			all, allProxies := lookup(group, "include-all"), lookup(group, "include-all-proxies")

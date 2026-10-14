@@ -5,12 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
 	"unicode"
 
-	"clisimplehub/tui/internal/core"
+	"tim/internal/core"
 
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
@@ -28,7 +29,8 @@ type screen struct {
 	notice                *resultView
 	right                 *tview.TextView
 	footer                *tview.TextView
-	version, latest, ip   string
+	version, latest       string
+	ips                   map[string]string
 	network               bool
 	networkCancel         context.CancelFunc
 	generation            uint64
@@ -50,26 +52,15 @@ func Run(m *core.Manager) error {
 			s.networkCancel()
 		}
 	}()
-	go s.app.QueueUpdateDraw(func() { s.workResult(m.AutoStart) })
-	done := make(chan struct{})
-	defer close(done)
-	go func() {
-		ticker := time.NewTicker(time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-done:
-				return
-			case <-ticker.C:
-				s.app.QueueUpdateDraw(func() {})
-			}
-		}
-	}()
+	go s.app.QueueUpdateDraw(func() {
+		s.refreshNetwork(false)
+		s.startup()
+	})
 	return s.app.Run()
 }
 func newScreen(m *core.Manager) *screen {
 	tview.Styles.PrimitiveBackgroundColor = tcell.ColorDefault
-	s := &screen{app: tview.NewApplication().EnableMouse(true), pages: tview.NewPages(), manager: m}
+	s := &screen{app: tview.NewApplication().EnableMouse(true), pages: tview.NewPages(), manager: m, ips: make(map[string]string)}
 	s.status = tview.NewTextView().SetDynamicColors(true).SetWrap(false)
 	s.status.SetScrollable(false)
 	s.right = tview.NewTextView().SetDynamicColors(true).SetTextAlign(tview.AlignRight).SetWrap(false)
@@ -327,13 +318,12 @@ func (s *screen) settings() {
 		s.failure(err)
 		return
 	}
-	baseline := v.URL
 	form := tview.NewForm()
 	commit := func() {
 		snapshot := v.Clone()
 		s.onSuccess = s.close
 		s.keepDialog = true
-		s.work("配置已更新", func(ctx context.Context) error {
+		s.work("订阅下载成功并已保存", func(ctx context.Context) error {
 			return s.manager.RefreshURL(ctx, snapshot.URL)
 		})
 		s.keepDialog = false
@@ -341,15 +331,20 @@ func (s *screen) settings() {
 	form.AddInputField("订阅 URL", v.URL, 70, nil, func(t string) { v.URL = strings.TrimSpace(t) })
 	form.AddButton("下载 / 刷新订阅", commit)
 	back := func() {
-		if v.URL == baseline {
+		saved, err := s.manager.Store.Settings()
+		if err != nil {
+			s.failure(err)
+			return
+		}
+		if v.URL == saved.URL {
 			s.close()
 			return
 		}
-		s.confirmSettings(form, "subscription-confirm", "订阅设置有修改，是否应用新配置？", commit)
+		s.confirmSettings(form, "subscription-confirm", "订阅地址有修改，是否保存地址并下载订阅？", commit)
 	}
 	form.AddButton("返回", back)
 	form.SetCancelFunc(back)
-	form.SetBorder(true).SetTitle(" 订阅设置 · 退出时选择应用 ")
+	form.SetBorder(true).SetTitle(" 订阅设置 · 下载前保存地址 ")
 	s.show(form)
 }
 
@@ -367,7 +362,7 @@ func (s *screen) ports() {
 		integer bool
 		value   string
 	}
-	fields := []field{{"Mixed 端口（0 关闭）", []string{"mixed-port"}, true, ""}, {"HTTP 端口（0 关闭）", []string{"port"}, true, ""}, {"SOCKS 端口（0 关闭）", []string{"socks-port"}, true, ""}, {"代理监听 IP", []string{"bind-address"}, false, ""}, {"控制接口地址:端口", []string{"external-controller"}, false, ""}}
+	fields := []field{{"Mixed 端口（0 关闭）", []string{"mixed-port"}, true, ""}, {"HTTP 端口（0 关闭）", []string{"port"}, true, ""}, {"SOCKS 端口（0 关闭）", []string{"socks-port"}, true, ""}, {"控制接口地址:端口", []string{"external-controller"}, false, ""}}
 	for i := range fields {
 		f := &fields[i]
 		f.value = cfg.Text(f.path...)
@@ -378,9 +373,12 @@ func (s *screen) ports() {
 	}
 	lan := cfg.Text("allow-lan") == "true"
 	form.AddCheckbox("允许局域网", lan, func(v bool) { lan = v })
+	stack := cfg.Text("tun", "stack")
+	stackOptions := []string{"mixed", "system", "gvisor"}
+	form.AddDropDown("栈模式", stackOptions, slices.Index(stackOptions, stack), func(option string, _ int) { stack = option })
 	delayURL := settings.DelayURL
 	form.AddInputField("延迟测试 URL（留空默认）", delayURL, 60, nil, func(v string) { delayURL = strings.TrimSpace(v) })
-	form.GetFormItem(6).(*tview.InputField).SetPlaceholder(core.DefaultDelayURL)
+	form.GetFormItem(form.GetFormItemCount() - 1).(*tview.InputField).SetPlaceholder(core.DefaultDelayURL)
 	mihomoPath := settings.MihomoPath
 	form.AddInputField("mihomo 路径", mihomoPath, 60, nil, func(v string) { mihomoPath = strings.TrimSpace(v) })
 	dataDir := settings.DataDir
@@ -394,6 +392,10 @@ func (s *screen) ports() {
 	}
 	initialLAN := lan
 	commit := func() {
+		if !slices.Contains(stackOptions, stack) {
+			s.failure(fmt.Errorf("请选择栈模式：mixed、system 或 gvisor"))
+			return
+		}
 		snapshot := settings.Clone()
 		snapshot.DelayURL = delayURL
 		snapshot.MihomoPath = mihomoPath
@@ -417,6 +419,10 @@ func (s *screen) ports() {
 			s.failure(err)
 			return
 		}
+		if err := snapshot.Config.Set(stack, "tun", "stack"); err != nil {
+			s.failure(err)
+			return
+		}
 		s.onSuccess = s.close
 		s.keepDialog = true
 		s.work("配置已更新", func(ctx context.Context) error {
@@ -425,7 +431,7 @@ func (s *screen) ports() {
 		s.keepDialog = false
 	}
 	back := func() {
-		dirty := lan != initialLAN || delayURL != settings.DelayURL || mihomoPath != settings.MihomoPath || dataDir != settings.DataDir
+		dirty := lan != initialLAN || stack != cfg.Text("tun", "stack") || delayURL != settings.DelayURL || mihomoPath != settings.MihomoPath || dataDir != settings.DataDir
 		for i, f := range fields {
 			dirty = dirty || f.value != initial[i]
 		}
@@ -623,7 +629,12 @@ func (s *screen) renderStatus() {
 	if s.last.Tun {
 		tun = "开"
 	}
-	line := s.delayNode(&s.exitDelay, "GLOBAL: ", s.last.Global, s.last.Global)
+	var line string
+	if s.last.Mode == "rule" {
+		line = s.delayNode(&s.exitDelay, "出口: ", "", "按规则路由")
+	} else {
+		line = s.delayNode(&s.exitDelay, "GLOBAL: ", s.last.Global, s.last.Global)
+	}
 	if s.last.Running && s.last.Chain.Text() != "" {
 		line = s.delayNode(&s.frontDelay, line+"  |  链式前置: ", s.last.Chain.Proxy, s.last.Chain.Text())
 	} else {
@@ -635,7 +646,15 @@ func (s *screen) renderStatus() {
 		version = "读取中"
 	}
 
-	s.right.SetText("mihomo " + tview.Escape(version) + "\n外网 IP: " + tview.Escape(s.ip))
+	items := []string{}
+	for _, probe := range core.PublicIPProbes() {
+		value := s.ips[probe.Label]
+		if value == "" {
+			value = "未查询"
+		}
+		items = append(items, probe.Label+": "+tview.Escape(value))
+	}
+	s.right.SetText("mihomo " + tview.Escape(version) + "\n" + strings.Join(items, "  |  "))
 	if page, _ := s.pages.GetFrontPage(); page == "main" {
 		s.renderFooter()
 	}
@@ -658,7 +677,9 @@ func (s *screen) refreshNetwork(healthy bool) {
 	s.networkCancel = cancel
 	generation := s.generation
 	running := s.last.Running && healthy
-	s.ip = "查询中"
+	for _, probe := range core.PublicIPProbes() {
+		s.ips[probe.Label] = "查询中"
+	}
 	s.latest = ""
 	s.renderStatus()
 	go func() {
@@ -695,25 +716,26 @@ func (s *screen) refreshNetwork(healthy bool) {
 			s.renderStatus()
 		})
 	}()
-	go func() {
-		ip, err := s.manager.PublicIP(ctx)
-		if ctx.Err() != nil {
-			return
-		}
-		s.app.QueueUpdateDraw(func() {
-			if generation != s.generation {
+	for _, probe := range core.PublicIPProbes() {
+		go func() {
+			ip, err := s.manager.PublicIP(ctx, probe)
+			if errors.Is(ctx.Err(), context.Canceled) {
 				return
 			}
-			s.ip = "查询失败"
-			if err == nil {
-				s.ip = ip.IP
-				if ip.Country != "" {
-					s.ip += " (" + ip.Country + ")"
+			s.app.QueueUpdateDraw(func() {
+				if generation != s.generation {
+					return
 				}
-			}
-			s.renderStatus()
-		})
-	}()
+				s.ips[probe.Label] = "查询失败"
+				if err == nil {
+					s.ips[probe.Label] = ip
+				} else {
+					s.notice.SetText(s.notice.GetText(false) + "\n" + probe.Label + " 查询失败: " + err.Error())
+				}
+				s.renderStatus()
+			})
+		}()
+	}
 }
 
 // 追加完整错误，避免后续操作覆盖排障信息。
