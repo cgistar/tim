@@ -14,7 +14,6 @@ import (
 	"regexp"
 	"runtime"
 	"strings"
-	"time"
 )
 
 type Asset struct {
@@ -140,7 +139,7 @@ func releaseAssets(ctx context.Context, client *http.Client, release Release) (R
 	return release, nil
 }
 func (m *Manager) Update(ctx context.Context) error {
-	return m.locked(func() error {
+	return m.withOperation(func() error {
 		client, err := m.ProxyClient(ctx)
 		if err != nil {
 			return err
@@ -152,13 +151,22 @@ func (m *Manager) Update(ctx context.Context) error {
 
 // 首次安装不能依赖尚未存在的代理内核，明确使用当前网络下载。
 func (m *Manager) InstallKernel(ctx context.Context) error {
-	return m.locked(func() error {
+	return m.withOperation(func() error {
 		missing, err := m.Store.KernelMissing()
 		if err != nil {
 			return err
 		}
 		if !missing {
-			return fmt.Errorf("配置的内核已存在，请使用内核更新")
+			binary, err := m.Store.Kernel()
+			if err == nil {
+				_, err = Version(ctx, binary)
+			}
+			if err == nil {
+				return fmt.Errorf("配置的内核可用，请使用内核更新")
+			}
+		}
+		if err := ctx.Err(); err != nil {
+			return err
 		}
 		return m.updateWithClient(ctx, m.HTTP)
 	})
@@ -194,21 +202,20 @@ func (m *Manager) updateWithClient(ctx context.Context, client *http.Client) err
 	if err != nil {
 		return err
 	}
-	if active.Runtime == "" {
-		return AtomicWrite(m.Store.Path("setting.yaml"), sb, 0600)
+	if active.Runtime != "" {
+		b, err := os.ReadFile(active.Runtime)
+		if err != nil {
+			return err
+		}
+		cfg, err := Parse(b)
+		if err != nil {
+			return err
+		}
+		if err = m.validate(ctx, path, cfg); err != nil {
+			return err
+		}
 	}
-	b, err := os.ReadFile(active.Runtime)
-	if err != nil {
-		return err
-	}
-	cfg, err := Parse(b)
-	if err != nil {
-		return err
-	}
-	if err = m.validate(ctx, path, cfg); err != nil {
-		return err
-	}
-	old, live, err := m.process()
+	_, live, err := m.managedProcess(ctx)
 	if err != nil {
 		return err
 	}
@@ -216,28 +223,19 @@ func (m *Manager) updateWithClient(ctx context.Context, client *http.Client) err
 		if err = m.stop(ctx); err != nil {
 			return err
 		}
-		if err = m.launch(ctx, path, active.Runtime); err != nil {
-			return m.restoreKernel(old, err)
-		}
 	}
-	if err = commitFiles(m.Store, []fileWrite{{"setting.yaml", sb}}); err != nil {
-		if live {
-			return m.restoreKernel(old, err)
-		}
+	if err = AtomicWrite(m.Store.Path("setting.yaml"), sb, 0600); err != nil {
 		return err
 	}
+	if err = m.syncService(ctx, path, m.Store.Path("config.yaml")); err != nil {
+		return fmt.Errorf("内核路径已保存，但同步服务失败: %w", err)
+	}
+	if live {
+		if err = m.launch(ctx, path, active.Runtime); err != nil {
+			return fmt.Errorf("内核路径已保存，但启动新版本失败: %w", err)
+		}
+	}
 	return nil
-}
-func (m *Manager) restoreKernel(old Process, cause error) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
-	defer cancel()
-	if err := m.stop(ctx); err != nil {
-		return fmt.Errorf("更新失败: %w；停止新版本失败: %v", cause, err)
-	}
-	if err := m.launch(ctx, old.Binary, m.Store.Path("config.yaml")); err != nil {
-		return fmt.Errorf("更新失败: %w；旧版本恢复失败: %v", cause, err)
-	}
-	return fmt.Errorf("更新失败，已恢复旧内核: %w", cause)
 }
 func (m *Manager) downloadKernel(ctx context.Context, r Release, a Asset, client *http.Client) (string, error) {
 	req, err := http.NewRequestWithContext(ctx, "GET", a.URL, nil)

@@ -76,13 +76,6 @@ func (m *Manager) ProxyClient(ctx context.Context) (*http.Client, error) {
 	if !st.Running {
 		return nil, fmt.Errorf("请先启动代理，启动完成后才能访问 GitHub")
 	}
-	_, live, err := m.process()
-	if err != nil {
-		return nil, err
-	}
-	if !live {
-		return nil, fmt.Errorf("代理已停止")
-	}
 	return m.runtimeProxyClient()
 }
 
@@ -150,20 +143,9 @@ func parseProbeIP(body []byte, ipv4Only bool) (string, error) {
 	return ip.String(), nil
 }
 func (m *Manager) PublicIP(ctx context.Context, probe IPProbe) (string, error) {
-	_, live, err := m.process()
-	if err != nil {
-		return "", err
-	}
-	if !live {
-		return QueryPublicIP(ctx, m.HTTP, probe)
-	}
-	client, err := m.runtimeProxyClient()
-	if err != nil {
-		return "", err
-	}
-	defer client.CloseIdleConnections()
-	return QueryPublicIP(ctx, client, probe)
+	return QueryPublicIP(ctx, m.IPClient, probe)
 }
+
 func VersionTag(v string) string {
 	for _, field := range strings.Fields(v) {
 		if strings.HasPrefix(field, "v") {
@@ -173,20 +155,55 @@ func VersionTag(v string) string {
 	return strings.TrimSpace(v)
 }
 func (m *Manager) CurrentVersion(ctx context.Context) (string, error) {
-	p, live, err := m.process()
-	if err != nil {
+	version, controllerErr := m.controllerVersion(ctx)
+	if controllerErr == nil && version != "" {
+		return version, nil
+	}
+	if err := ctx.Err(); err != nil {
 		return "", err
 	}
-	binary := p.Binary
-	if !live {
-		binary, err = m.Store.Kernel()
+	// 控制接口与本地文件是两个可读来源；接口故障不代表内核需要下载。
+	binary, err := m.Store.Kernel()
+	if err == nil {
+		version, err = Version(ctx, binary)
+	}
+	if err != nil {
+		return "", errors.Join(controllerErr, err)
+	}
+	return VersionTag(version), nil
+}
+
+func (m *Manager) controllerVersion(ctx context.Context) (string, error) {
+	raw, err := os.ReadFile(m.Store.Path("config.yaml"))
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return "", err
+	}
+	if err == nil {
+		cfg, err := Parse(raw)
 		if err != nil {
 			return "", err
 		}
+		if cfg.Text("external-controller") != "" {
+			c, err := NewController(cfg)
+			if err != nil {
+				return "", err
+			}
+			var version struct {
+				Version string `json:"version"`
+			}
+			err = c.Do(ctx, "GET", "/version", nil, &version)
+			if err == nil {
+				if version.Version == "" {
+					return "", fmt.Errorf("控制接口未返回内核版本")
+				}
+				return VersionTag(version.Version), nil
+			}
+			return "", err
+		}
 	}
-	v, err := Version(ctx, binary)
-	return VersionTag(v), err
+	return "", nil
 }
+
 func NewerRelease(current, candidate string) bool {
 	parse := func(s string) ([3]int, bool) {
 		var out [3]int

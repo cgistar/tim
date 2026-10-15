@@ -327,7 +327,7 @@ func (m *Manager) validateWithChain(ctx context.Context, binary string, cfg, bas
 	// 只有内核拒绝含前置的配置、且原配置独立通过时，才停用这项附加功能。
 	plainSettings := settings.Clone()
 	plainSettings.Chain.Enabled = false
-	plain, _, buildErr := BuildConfigured(base, user, plainSettings)
+	plain, _, buildErr := m.buildConfigured(base, user, plainSettings)
 	if buildErr != nil {
 		return nil, buildErr
 	}

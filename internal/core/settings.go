@@ -164,6 +164,11 @@ func ParseSettings(raw []byte) (Settings, error) {
 	config := &Document{Root: yaml.Node{Kind: yaml.DocumentNode, Content: []*yaml.Node{cloneNode(d.Get("config"))}}}
 	config.Delete("bind-address")
 	s := Settings{DataDir: d.Text("data-dir"), MihomoPath: d.Text("mihomo-path"), URL: d.Text("subscription_url"), FakeIP: d.Text("fake-ip-enabled") == "true", Config: config}
+	if config.Get("tun", "strict-route") == nil {
+		if err := config.Set(true, "tun", "strict-route"); err != nil {
+			return Settings{}, err
+		}
+	}
 	if n := d.Get("delay-test-url"); n != nil {
 		if n.Tag != "!!str" {
 			return Settings{}, fmt.Errorf("delay-test-url 必须为字符串")
@@ -208,7 +213,7 @@ func (s Settings) Validate() error {
 	if err := validateConfig(s.Config); err != nil {
 		return err
 	}
-	for _, path := range [][]string{{"dns", "ipv6"}, {"dns", "enable"}, {"sniffer", "enable"}, {"tun", "enable"}, {"allow-lan"}} {
+	for _, path := range [][]string{{"dns", "ipv6"}, {"dns", "enable"}, {"sniffer", "enable"}, {"tun", "enable"}, {"tun", "strict-route"}, {"allow-lan"}} {
 		n := s.Config.Get(path...)
 		if n == nil || n.Tag != "!!bool" {
 			return fmt.Errorf("%s 必须为布尔值", strings.Join(path, "."))

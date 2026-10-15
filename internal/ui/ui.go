@@ -18,6 +18,7 @@ import (
 )
 
 type screen struct {
+	rootSession           bool
 	onSuccess             func()
 	errorLogPath          string
 	logView               *tview.TextView
@@ -30,6 +31,7 @@ type screen struct {
 	right                 *tview.TextView
 	footer                *tview.TextView
 	version, latest       string
+	versionUnavailable    bool
 	ips                   map[string]string
 	network               bool
 	networkCancel         context.CancelFunc
@@ -45,6 +47,9 @@ type screen struct {
 
 func Run(m *core.Manager) error {
 	s := newScreen(m)
+	session := m.EnableRootSession(s.rootPassword)
+	s.rootSession = os.Geteuid() != 0
+	defer session.Close()
 	s.network = true
 	defer func() {
 		s.resetDelays()
@@ -53,14 +58,16 @@ func Run(m *core.Manager) error {
 		}
 	}()
 	go s.app.QueueUpdateDraw(func() {
-		s.refreshNetwork(false)
 		s.startup()
+		if !s.busy {
+			s.refreshNetwork(false)
+		}
 	})
 	return s.app.Run()
 }
 func newScreen(m *core.Manager) *screen {
 	tview.Styles.PrimitiveBackgroundColor = tcell.ColorDefault
-	s := &screen{app: tview.NewApplication().EnableMouse(true), pages: tview.NewPages(), manager: m, ips: make(map[string]string)}
+	s := &screen{app: tview.NewApplication().EnableMouse(true), pages: tview.NewPages(), manager: m, ips: make(map[string]string), last: core.Status{Unknown: true}}
 	s.status = tview.NewTextView().SetDynamicColors(true).SetWrap(false)
 	s.status.SetScrollable(false)
 	s.right = tview.NewTextView().SetDynamicColors(true).SetTextAlign(tview.AlignRight).SetWrap(false)
@@ -87,6 +94,7 @@ func newScreen(m *core.Manager) *screen {
 		{'d', "DNS 配置", "监听 / fake-ip / IPv6 / 域名嗅探 / 上游 / 过滤列表", s.dns},
 		{'a', "链式前置代理", "独立节点 YAML / 分享链接 / Base64", s.chain},
 		{'e', "编辑 user.yaml", "保留自定义配置；停止输入后自动应用", s.editor},
+		{'i', "安装服务", "系统保活 / 开机启动", s.serviceAction},
 	}
 	for _, item := range menuItems {
 		s.menu.AddItem(shortcutHint(strings.ToUpper(string(item.key)), item.label), item.description, 0, item.open)
@@ -129,19 +137,25 @@ func newScreen(m *core.Manager) *screen {
 	root := tview.NewFlex().SetDirection(tview.FlexRow).AddItem(header, 4, 0, false).AddItem(s.menu, 0, 1, true).AddItem(s.notice, 5, 0, false)
 	s.pages.AddPage("main", root, true, true)
 	s.app.SetMouseCapture(func(event *tcell.EventMouse, action tview.MouseAction) (*tcell.EventMouse, tview.MouseAction) {
+		if page, _ := s.pages.GetFrontPage(); page == "root-authorization" {
+			return event, action
+		}
 		if s.busy {
 			return nil, action
 		}
-		if s.delayMouse(event, action) {
+		if s.kernelDownloadMouse(event, action) || s.delayMouse(event, action) {
 			return nil, action
 		}
 		return event, action
 	})
 	s.app.SetInputCapture(func(e *tcell.EventKey) *tcell.EventKey {
+		if page, _ := s.pages.GetFrontPage(); page == "root-authorization" && e.Key() != tcell.KeyCtrlC {
+			return e
+		}
 		if s.busy {
 			if e.Key() == tcell.KeyCtrlC && s.cancel != nil {
 				s.cancel()
-				s.notice.SetText("正在取消，请等待清理或恢复完成…")
+				s.notice.SetText("正在取消，请等待当前步骤结束；已保存的修改保留…")
 			}
 			return nil
 		}
@@ -172,16 +186,24 @@ func newScreen(m *core.Manager) *screen {
 				}
 				return nil
 			case 's':
-				s.workResult(m.ToggleRunning)
+				s.runKernel(m.ToggleRunning)
 				return nil
 			case 'r':
-				s.workResult(m.Restart)
+				s.runKernel(m.Restart)
+				return nil
+			case 'k':
+				if s.versionUnavailable {
+					s.kernelDialog(nil)
+				}
 				return nil
 			case 'm':
 				s.mode()
 				return nil
 			case 't':
 				s.tun()
+				return nil
+			case 'b':
+				s.networkGuard()
 				return nil
 			}
 		}
@@ -217,9 +239,24 @@ func (s *screen) workResult(fn func(context.Context) (string, error)) {
 	go func() {
 		defer cancel()
 		message, err := fn(ctx)
-		statusCtx, statusCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		statusCtx, statusCancel := context.WithTimeout(ctx, 5*time.Second)
 		st, se := s.manager.Status(statusCtx)
 		statusCancel()
+		// 操作失败后只展示错误，避免收尾状态查询立即再次要求密码。
+		needsRoot := err == nil && s.rootSession && st.Guard.NeedsRoot
+		if needsRoot {
+			// 先展示无需权限的状态并开始联网查询，再等待防火墙的会话授权。
+			initial := st
+			s.app.QueueUpdateDraw(func() {
+				s.last = initial
+				s.updateServiceMenu()
+				s.renderStatus()
+				if s.network {
+					s.refreshNetwork(se == nil)
+				}
+			})
+			st.Guard, _ = s.manager.NetworkGuardStatus(ctx)
+		}
 		s.app.QueueUpdateDraw(func() {
 			s.busy = false
 			if err == nil && onSuccess != nil {
@@ -227,14 +264,9 @@ func (s *screen) workResult(fn func(context.Context) (string, error)) {
 			}
 			s.cancel = nil
 			s.last = st
-			if !st.Running {
-				if cfg, _, e := s.manager.Preview(); e == nil {
-					s.last.Mode = cfg.Text("mode")
-					s.last.Tun = cfg.Text("tun", "enable") == "true"
-				}
-			}
+			s.updateServiceMenu()
 			s.renderStatus()
-			if s.network {
+			if s.network && !needsRoot {
 				s.refreshNetwork(se == nil)
 			}
 			msg := message
@@ -242,13 +274,27 @@ func (s *screen) workResult(fn func(context.Context) (string, error)) {
 				msg = err.Error()
 			}
 			if se != nil {
-				msg += "\n状态检查: " + se.Error()
+				if err == nil {
+					msg = "状态检查: " + se.Error()
+				} else if !strings.Contains(msg, se.Error()) {
+					msg += "\n状态检查: " + se.Error()
+				}
+			}
+			if st.Guard.Error != "" && !strings.Contains(msg, st.Guard.Error) {
+				if err == nil && se == nil {
+					msg = "断网保护异常: " + st.Guard.Error
+				} else {
+					msg += "\n断网保护异常: " + st.Guard.Error
+				}
 			}
 			if st.Chain.Reason != "" {
 				msg += "\n链式前置: " + st.Chain.Text()
 			}
+			if !st.Running && st.Service.Active {
+				msg += "\n" + st.Message
+			}
 			s.notice.SetText(msg)
-			if err != nil || se != nil {
+			if err != nil || se != nil || st.Guard.Error != "" {
 				s.failure(fmt.Errorf("%s", msg))
 			}
 		})
@@ -279,15 +325,24 @@ func (s *screen) failure(err error) {
 	if logPath == "" {
 		logPath = s.manager.Store.Path("error.log")
 	}
-	if e := appendErrorLog(logPath, message); e != nil {
-		message += "\n错误日志写入失败: " + e.Error()
-	} else {
+	logErr := appendErrorLog(logPath, message)
+	if logErr != nil {
+		message += "\n错误日志写入失败: " + logErr.Error()
+	}
+	if page, _ := s.pages.GetFrontPage(); page == "main" {
+		s.notice.SetText(time.Now().Format("2006-01-02 15:04:05") + " error: " + message)
+		return
+	}
+	if logErr == nil {
 		message += "\n完整错误已追加至 error.log"
 	}
 	s.notice.SetText(message)
-	s.resultDetails(message)
+	s.showResultDetails(message, true)
 }
 func (s *screen) resultDetails(message string) {
+	s.showResultDetails(message, false)
+}
+func (s *screen) showResultDetails(message string, popup bool) {
 	previous := s.app.GetFocus()
 	previousFooter := s.footer.GetText(false)
 	detail := newResultView().SetText(message)
@@ -300,7 +355,21 @@ func (s *screen) resultDetails(message string) {
 		}
 		return e
 	})
-	s.pages.AddPage("error", detail, true, true)
+	var view tview.Primitive = detail
+	if popup {
+		detail.SetTitle(" 错误提示 · [Esc / Enter 关闭] · ↑↓ 滚动 ")
+		detail.SetBackgroundColor(tcell.ColorDarkSlateGray)
+		detail.SetTextStyle(tcell.StyleDefault.Foreground(tcell.ColorWhite).Background(tcell.ColorDarkSlateGray))
+		row := tview.NewFlex().AddItem(nil, 0, 1, false).AddItem(detail, 88, 0, true).AddItem(nil, 0, 1, false)
+		layout := tview.NewFlex().SetDirection(tview.FlexRow).AddItem(nil, 0, 1, false).AddItem(row, 18, 0, true).AddItem(nil, 0, 1, false)
+		layout.SetDrawFunc(func(_ tcell.Screen, _, _, width, height int) (int, int, int, int) {
+			row.ResizeItem(detail, max(1, min(88, width-4)), 0)
+			layout.ResizeItem(row, max(1, min(18, height-4)), 0)
+			return layout.GetInnerRect()
+		})
+		view = layout
+	}
+	s.pages.AddPage("error", view, true, true)
 	s.app.SetFocus(detail)
 	s.footer.SetText("[yellow]" + shortcutHint("↑↓/PgUp/PgDn", "滚动") + "[-]  [yellow]" + shortcutHint("Home/End", "首尾") + "[-]  [yellow]" + shortcutHint("Esc", "返回") + "[-]")
 }
@@ -311,6 +380,24 @@ func (s *screen) confirm(text string, fn func()) {
 			fn()
 		}
 	}))
+}
+
+func (s *screen) updateServiceMenu() {
+	label, description := "安装服务", "保活 / 开机启动；请先停止内核"
+	if s.last.Service.Installed {
+		label, description = "卸载服务", "确认后停止内核并移除服务，保留配置和数据"
+	}
+	s.menu.SetItemText(5, shortcutHint("I", label), description)
+}
+
+func (s *screen) serviceAction() {
+	if s.last.Service.Installed {
+		s.confirm("将停止内核并卸载服务，保留配置和数据。是否继续？", func() {
+			s.work("服务已卸载，内核已停止；断网保护保持原状，需单独关闭", s.manager.UninstallService)
+		})
+		return
+	}
+	s.work("服务已安装，内核保持停止；按 S 启动", s.manager.InstallService)
 }
 func (s *screen) settings() {
 	v, err := s.manager.Store.Settings()
@@ -376,6 +463,8 @@ func (s *screen) ports() {
 	stack := cfg.Text("tun", "stack")
 	stackOptions := []string{"mixed", "system", "gvisor"}
 	form.AddDropDown("栈模式", stackOptions, slices.Index(stackOptions, stack), func(option string, _ int) { stack = option })
+	strictRoute := cfg.Text("tun", "strict-route") == "true"
+	form.AddCheckbox("严格路由", strictRoute, func(v bool) { strictRoute = v })
 	delayURL := settings.DelayURL
 	form.AddInputField("延迟测试 URL（留空默认）", delayURL, 60, nil, func(v string) { delayURL = strings.TrimSpace(v) })
 	form.GetFormItem(form.GetFormItemCount() - 1).(*tview.InputField).SetPlaceholder(core.DefaultDelayURL)
@@ -423,6 +512,10 @@ func (s *screen) ports() {
 			s.failure(err)
 			return
 		}
+		if err := snapshot.Config.Set(strictRoute, "tun", "strict-route"); err != nil {
+			s.failure(err)
+			return
+		}
 		s.onSuccess = s.close
 		s.keepDialog = true
 		s.work("配置已更新", func(ctx context.Context) error {
@@ -431,7 +524,7 @@ func (s *screen) ports() {
 		s.keepDialog = false
 	}
 	back := func() {
-		dirty := lan != initialLAN || stack != cfg.Text("tun", "stack") || delayURL != settings.DelayURL || mihomoPath != settings.MihomoPath || dataDir != settings.DataDir
+		dirty := lan != initialLAN || stack != cfg.Text("tun", "stack") || strictRoute != (cfg.Text("tun", "strict-route") == "true") || delayURL != settings.DelayURL || mihomoPath != settings.MihomoPath || dataDir != settings.DataDir
 		for i, f := range fields {
 			dirty = dirty || f.value != initial[i]
 		}
@@ -617,30 +710,62 @@ func (s *screen) refreshLogs() {
 }
 
 func (s *screen) renderStatus() {
-	state, mode, tun := "停止", "规则", "关"
+	state, mode := "停止", ""
 	color := "red"
 	if s.last.Running {
-		state = "运行"
-		color = "green"
+		state, color = "运行", "green"
+	} else if s.last.Unknown {
+		state, color = "状态未知", "yellow"
 	}
-	if s.last.Mode == "global" {
-		mode = "全局"
-	}
-	if s.last.Tun {
-		tun = "开"
+	if s.last.Running {
+		switch s.last.Mode {
+		case "rule":
+			mode = "规则"
+		case "global":
+			mode = "全局"
+		case "direct":
+			mode = "直连"
+		}
 	}
 	var line string
-	if s.last.Mode == "rule" {
+	if s.last.Running && s.last.Mode == "rule" {
 		line = s.delayNode(&s.exitDelay, "出口: ", "", "按规则路由")
-	} else {
+	} else if s.last.Running && s.last.Mode == "global" && s.last.Global != "" {
 		line = s.delayNode(&s.exitDelay, "GLOBAL: ", s.last.Global, s.last.Global)
+	} else {
+		s.exitDelay.reset()
 	}
 	if s.last.Running && s.last.Chain.Text() != "" {
-		line = s.delayNode(&s.frontDelay, line+"  |  链式前置: ", s.last.Chain.Proxy, s.last.Chain.Text())
+		if line != "" {
+			line += "  |  "
+		}
+		line = s.delayNode(&s.frontDelay, line+"链式前置: ", s.last.Chain.Proxy, s.last.Chain.Text())
 	} else {
 		s.frontDelay.reset()
 	}
-	s.status.SetText(fmt.Sprintf("状态: [%s]%s[-]  模式: %s  TUN: %s\n%s", color, state, mode, tun, line))
+	statusItems := []string{fmt.Sprintf("[%s]%s[-]", color, state)}
+	if mode != "" {
+		statusItems = append(statusItems, mode)
+	}
+	if s.last.Running && s.last.Tun {
+		statusItems = append(statusItems, "TUN")
+	}
+	if s.last.Service.Installed {
+		statusItems = append(statusItems, "Service")
+		if !s.last.Running && s.last.Service.Result != "" && s.last.Service.Result != "success" {
+			line += "  服务: " + tview.Escape(s.last.Service.State+" "+s.last.Service.Result)
+		}
+	}
+	if s.last.Guard.Enabled {
+		statusItems = append(statusItems, "已断网保存")
+	}
+	if s.last.Guard.Active && (!s.last.Running || !s.last.Tun) {
+		if line != "" {
+			line += "  |  "
+		}
+		line += "保护已开启，TUN 未就绪"
+	}
+	s.status.SetText(strings.Join(statusItems, " | ") + "\n" + line)
 	version := s.version
 	if version == "" {
 		version = "读取中"
@@ -654,7 +779,11 @@ func (s *screen) renderStatus() {
 		}
 		items = append(items, probe.Label+": "+tview.Escape(value))
 	}
-	s.right.SetText("mihomo " + tview.Escape(version) + "\n" + strings.Join(items, "  |  "))
+	versionText := "mihomo " + tview.Escape(version)
+	if s.versionUnavailable {
+		versionText = "mihomo [yellow]" + tview.Escape("[下载]") + "[-]"
+	}
+	s.right.SetText(versionText + "\n" + strings.Join(items, "  |  "))
 	if page, _ := s.pages.GetFrontPage(); page == "main" {
 		s.renderFooter()
 	}
@@ -663,9 +792,13 @@ func (s *screen) renderFooter() {
 	items := []string{
 		shortcutHint("S", "启动/停止"), shortcutHint("R", "重启"),
 		shortcutHint("L", "日志"), shortcutHint("M", "模式"), shortcutHint("T", "TUN"),
+		shortcutHint("B", "断网保护"),
 	}
 	if s.latest != "" {
 		items = append(items, shortcutHint("U", "更新 "+s.latest))
+	}
+	if s.versionUnavailable {
+		items = append(items, shortcutHint("K", "下载内核"))
 	}
 	items = append(items, shortcutHint("V", "预览"), shortcutHint("F", "刷新"), shortcutHint("O", "结果"), shortcutHint("Q", "退出"))
 	text := "[yellow]" + strings.Join(items, "  ") + "[-]"
@@ -673,6 +806,12 @@ func (s *screen) renderFooter() {
 }
 
 func (s *screen) refreshNetwork(healthy bool) {
+	if s.networkCancel != nil {
+		s.networkCancel()
+	}
+	s.generation++
+	// TUN 重建后不能复用旧路由下建立的空闲连接。
+	s.manager.IPClient.CloseIdleConnections()
 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 	s.networkCancel = cancel
 	generation := s.generation
@@ -684,15 +823,17 @@ func (s *screen) refreshNetwork(healthy bool) {
 	s.renderStatus()
 	go func() {
 		version, err := s.manager.CurrentVersion(ctx)
-		if err != nil {
-			version = "未安装/不可读"
-		}
+		unavailable := err != nil
 		if ctx.Err() != nil {
 			return
 		}
 		s.app.QueueUpdateDraw(func() {
 			if generation == s.generation {
 				s.version = version
+				s.versionUnavailable = unavailable
+				if err != nil {
+					s.notice.SetText(s.notice.GetText(false) + "\n内核版本读取失败: " + err.Error())
+				}
 				s.renderStatus()
 			}
 		})

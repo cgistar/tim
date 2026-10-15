@@ -1,7 +1,6 @@
 package core
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -14,9 +13,9 @@ import (
 )
 
 func (m *Manager) UpdateSubscription(ctx context.Context, hot bool) error {
-	return m.locked(func() error {
+	return m.withOperation(func() error {
 		if hot {
-			if _, live, err := m.process(); err != nil {
+			if _, live, err := m.processContext(ctx); err != nil {
 				return err
 			} else if !live {
 				return fmt.Errorf("热更新要求 mihomo 正在运行，未下载订阅")
@@ -26,11 +25,11 @@ func (m *Manager) UpdateSubscription(ctx context.Context, hot bool) error {
 		if err != nil {
 			return err
 		}
-		return m.refreshSubscription(ctx, s, true, hot)
+		return m.refreshSubscription(ctx, s, hot)
 	})
 }
 func (m *Manager) applyHot(ctx context.Context, base, user *Document, settings Settings) error {
-	p, live, err := m.process()
+	p, live, err := m.processContext(ctx)
 	if err != nil {
 		return err
 	}
@@ -45,7 +44,7 @@ func (m *Manager) applyHot(ctx context.Context, base, user *Document, settings S
 	if err != nil {
 		return err
 	}
-	cfg, _, err := BuildConfigured(base, user, settings)
+	cfg, _, err := m.buildConfigured(base, user, settings)
 	if err != nil {
 		return err
 	}
@@ -68,7 +67,7 @@ func (m *Manager) applyHot(ctx context.Context, base, user *Document, settings S
 		return err
 	}
 	check := func(ctx context.Context, d *Document) error {
-		same, err := matchesProcess(p)
+		same, err := m.matchesManaged(ctx, p)
 		if err != nil {
 			return err
 		}
@@ -79,69 +78,34 @@ func (m *Manager) applyHot(ctx context.Context, base, user *Document, settings S
 		if err != nil {
 			return err
 		}
-		return verifyRuntime(p, d, info)
+		return m.verifyProcess(ctx, p, d, info)
 	}
-	snapshot := make([]fileWrite, 0, 3)
-	for _, name := range []string{"config.yaml", "subscription.yaml", "setting.yaml"} {
-		raw, e := os.ReadFile(m.Store.Path(name))
-		if e != nil && !errors.Is(e, os.ErrNotExist) {
-			return e
-		}
-		snapshot = append(snapshot, fileWrite{name, raw})
-	}
-	rollback := func(cause error) error {
-		recovery, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		defer cancel()
-		var restoreErrors []error
-		for _, file := range snapshot {
-			current, e := os.ReadFile(m.Store.Path(file.name))
-			if e == nil && bytes.Equal(current, file.data) {
-				continue
-			}
-			if file.data == nil {
-				e = os.Remove(m.Store.Path(file.name))
-				if errors.Is(e, os.ErrNotExist) {
-					e = nil
-				}
-			} else {
-				e = AtomicWrite(m.Store.Path(file.name), file.data, 0600)
-			}
-			if e != nil {
-				restoreErrors = append(restoreErrors, fmt.Errorf("恢复 %s 失败: %w", file.name, e))
-			}
-		}
-		if e := controller.Do(recovery, "PUT", "/configs?force=true", map[string]string{"payload": string(oldRaw)}, nil); e != nil {
-			restoreErrors = append(restoreErrors, fmt.Errorf("恢复运行配置失败: %w", e))
-		} else if e = check(recovery, old); e != nil {
-			restoreErrors = append(restoreErrors, fmt.Errorf("恢复运行检查失败: %w", e))
-		}
-		if len(restoreErrors) > 0 {
-			return errors.Join(append([]error{cause}, restoreErrors...)...)
-		}
-		return fmt.Errorf("热更新失败，已恢复旧运行配置及文件: %w", cause)
-	}
-	if err = controller.Do(ctx, "PUT", "/configs?force=true", map[string]string{"payload": string(raw)}, nil); err != nil {
-		return rollback(err)
-	}
-	if err = check(ctx, cfg); err != nil {
-		return rollback(err)
-	}
+
 	baseRaw, err := base.Bytes()
 	if err != nil {
-		return rollback(err)
+		return err
 	}
 	settingsRaw, err := settings.Bytes()
 	if err != nil {
-		return rollback(err)
+		return err
 	}
-	if err = commitFiles(m.Store, []fileWrite{{"config.yaml", raw}, {"subscription.yaml", baseRaw}, {"setting.yaml", settingsRaw}}); err != nil {
-		return rollback(err)
+	if err = ctx.Err(); err != nil {
+		return err
+	}
+	if err = commitFiles(m.Store, []fileWrite{{"subscription.yaml", baseRaw}, {"config.yaml", raw}, {"setting.yaml", settingsRaw}}); err != nil {
+		return err
+	}
+	if err = controller.Do(ctx, "PUT", "/configs?force=true", map[string]string{"payload": string(raw)}, nil); err != nil {
+		return fmt.Errorf("配置已保存，但热更新失败: %w", err)
+	}
+	if err = check(ctx, cfg); err != nil {
+		return fmt.Errorf("配置已保存，但热更新运行检查失败: %w", err)
 	}
 	return nil
 }
 
 func (m *Manager) SaveSettings(v Settings) error {
-	return m.locked(func() error {
+	return m.withOperation(func() error {
 		if v.URL != "" {
 			if err := validateURL(v.URL); err != nil {
 				return err
@@ -160,7 +124,7 @@ func (m *Manager) SaveSettings(v Settings) error {
 	})
 }
 func (m *Manager) Refresh(ctx context.Context) error {
-	return m.locked(func() error {
+	return m.withOperation(func() error {
 		s, err := m.Store.Settings()
 		if err != nil {
 			return err
@@ -171,7 +135,7 @@ func (m *Manager) Refresh(ctx context.Context) error {
 
 // 地址、下载缓存与运行配置分别提交，后续失败不撤销已完成的阶段。
 func (m *Manager) RefreshURL(ctx context.Context, rawURL string) error {
-	return m.locked(func() error {
+	return m.withOperation(func() error {
 		if err := validateURL(rawURL); err != nil {
 			return err
 		}
@@ -195,9 +159,9 @@ func (m *Manager) RefreshURL(ctx context.Context, rawURL string) error {
 }
 
 func (m *Manager) refresh(ctx context.Context, s Settings) error {
-	return m.refreshSubscription(ctx, s, false, false)
+	return m.refreshSubscription(ctx, s, false)
 }
-func (m *Manager) refreshSubscription(ctx context.Context, s Settings, forceStart, hot bool) error {
+func (m *Manager) refreshSubscription(ctx context.Context, s Settings, hot bool) error {
 	base, err := m.downloadSubscription(ctx, s.URL)
 	if err != nil {
 		return err
@@ -210,7 +174,7 @@ func (m *Manager) refreshSubscription(ctx context.Context, s Settings, forceStar
 	if err = AtomicWrite(m.Store.Path("subscription.yaml"), raw, 0600); err != nil {
 		return fmt.Errorf("订阅已下载，但保存缓存失败: %w", err)
 	}
-	if err = m.applySubscription(ctx, base, s, forceStart, hot); err != nil {
+	if err = m.applySubscription(ctx, base, s, hot); err != nil {
 		return fmt.Errorf("订阅下载成功并已保存；内核应用失败: %w", err)
 	}
 	return nil
@@ -248,14 +212,7 @@ func (m *Manager) downloadSubscription(ctx context.Context, rawURL string) (*Doc
 	return base, nil
 }
 
-func (m *Manager) applySubscription(ctx context.Context, base *Document, s Settings, forceStart, hot bool) error {
-	_, live, err := m.process()
-	if err != nil {
-		return err
-	}
-	if !live && !forceStart && !hot {
-		return nil
-	}
+func (m *Manager) applySubscription(ctx context.Context, base *Document, s Settings, hot bool) error {
 	u, err := m.Store.User()
 	if err != nil {
 		return err
@@ -263,7 +220,7 @@ func (m *Manager) applySubscription(ctx context.Context, base *Document, s Setti
 	if hot {
 		return m.applyHot(ctx, base, u, s)
 	}
-	return m.apply(ctx, base, u, s, live || forceStart)
+	return m.apply(ctx, base, u, s)
 }
 
 func (s *Store) Base() (*Document, error) {
@@ -291,7 +248,19 @@ func (s *Store) Preview() (*Document, []string, error) {
 
 func (m *Manager) Candidate() (*Document, error) { return m.Store.Base() }
 func (m *Manager) Preview() (*Document, []string, error) {
-	return m.Store.Preview()
+	cfg, warnings, err := m.Store.Preview()
+	if err != nil {
+		return cfg, warnings, err
+	}
+	guard, err := m.readNetworkGuardStatus(context.Background())
+	if err != nil {
+		warnings = append(warnings, "无法读取断网保护状态，预览未包含保护参数: "+err.Error())
+		return cfg, warnings, nil
+	}
+	if guard.Active {
+		err = configureGuard(cfg)
+	}
+	return cfg, warnings, err
 }
 
 // 模式和 TUN 仅由管理设置决定，过滤副本以保留用户原文件。
@@ -385,31 +354,46 @@ func Build(base, user *Document) (*Document, []string, error) {
 	}
 	return out, warnings, nil
 }
-func (m *Manager) apply(ctx context.Context, base, user *Document, settings Settings, start bool) error {
-	cfg, _, err := BuildConfigured(base, user, settings)
+func (m *Manager) apply(ctx context.Context, base, user *Document, settings Settings) error {
+	return m.applyTo(ctx, m, base, user, settings)
+}
+
+// 配置准备、提交与运行应用按阶段执行；停止态提交后仍保持停止。
+func (m *Manager) applyTo(ctx context.Context, target *Manager, base, user *Document, settings Settings) error {
+	cfg, _, err := target.buildConfigured(base, user, settings)
 	if err != nil {
 		return err
 	}
-	binary, err := resolveBinary(m.Store.ResolvePath(settings.MihomoPath))
+	_, live, err := m.managedProcess(ctx)
 	if err != nil {
 		return err
 	}
-	if cfg.Text("tun", "enable") == "true" && start && os.Geteuid() != 0 {
-		return fmt.Errorf("启用 TUN 需要 sudo/root")
-	}
-	if cfg, err = m.validateWithChain(ctx, binary, cfg, base, user, settings); err != nil {
-		return err
+	binary := target.Store.ResolvePath(settings.MihomoPath)
+	_, statErr := os.Stat(binary)
+	// 首次下载可以先生成配置；已有内核时必须通过内核校验，权限错误不能跳过。
+	if !errors.Is(statErr, os.ErrNotExist) || live {
+		binary, err = resolveBinary(binary)
+		if err != nil {
+			return err
+		}
+		cfg, err = target.validateWithChain(ctx, binary, cfg, base, user, settings)
+		if err != nil {
+			return err
+		}
 	}
 	raw, err := cfg.Bytes()
 	if err != nil {
 		return err
 	}
-	runtimePath := m.Store.Path("config.yaml")
-	previous, readErr := os.ReadFile(runtimePath)
-	if readErr != nil && !errors.Is(readErr, os.ErrNotExist) {
-		return readErr
+	userBytes, err := user.UserBytes()
+	if err != nil {
+		return err
 	}
-	old, live, err := m.process()
+	baseBytes, err := base.Bytes()
+	if err != nil {
+		return err
+	}
+	sb, err := settings.Bytes()
 	if err != nil {
 		return err
 	}
@@ -418,64 +402,46 @@ func (m *Manager) apply(ctx context.Context, base, user *Document, settings Sett
 			return err
 		}
 	}
-	rollback := func(cause error) error {
-		rollbackCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		if _, running, e := m.process(); e != nil {
-			return fmt.Errorf("应用失败: %w；无法确认新进程状态: %v", cause, e)
-		} else if running {
-			if e = m.stop(rollbackCtx); e != nil {
-				return fmt.Errorf("应用失败: %w；停止新进程失败: %v", cause, e)
-			}
-		}
-		if e := m.stop(rollbackCtx); e != nil {
-			return fmt.Errorf("应用失败: %w；清理进程状态失败: %v", cause, e)
-		}
-		var restoreErr error
-		if readErr == nil {
-			restoreErr = AtomicWrite(runtimePath, previous, 0600)
-		} else {
-			restoreErr = os.Remove(runtimePath)
-			if errors.Is(restoreErr, os.ErrNotExist) {
-				restoreErr = nil
-			}
-		}
-		if restoreErr != nil {
-			return fmt.Errorf("应用失败: %w；恢复 config.yaml 失败: %v", cause, restoreErr)
-		}
-		if live {
-			if e := m.launch(rollbackCtx, old.Binary, runtimePath); e != nil {
-				return fmt.Errorf("应用失败: %w；旧配置恢复失败: %v", cause, e)
-			}
-			return fmt.Errorf("应用失败，已恢复旧运行配置: %w", cause)
-		}
-		return cause
+	if err = ctx.Err(); err != nil {
+		return err
 	}
-	if err = AtomicWrite(runtimePath, raw, 0600); err != nil {
-		return rollback(err)
+	writes := []fileWrite{{"user.yaml", userBytes}, {"subscription.yaml", baseBytes}, {"config.yaml", raw}, {"setting.yaml", sb}}
+	if err = commitFiles(target.Store, writes); err != nil {
+		return err
 	}
-	if start {
-		if err = m.launch(ctx, binary, runtimePath); err != nil {
-			return rollback(err)
+	m.Store.dataDir.Store(target.Store.DataDir())
+	if err = target.syncService(ctx, binary, target.Store.Path("config.yaml")); err != nil {
+		return fmt.Errorf("配置已保存，但同步服务失败: %w", err)
+	}
+	if live {
+		if err = target.launch(ctx, binary, target.Store.Path("config.yaml")); err != nil {
+			return fmt.Errorf("配置已保存，但启动内核失败: %w", err)
+		}
+		// 服务启动命令返回时控制接口可能尚未监听，应用完成前确认新配置已就绪。
+		if err = waitAppliedConfig(ctx, cfg); err != nil {
+			return fmt.Errorf("配置已保存，但应用就绪检查失败: %w", err)
 		}
 	}
-	// 提交前保存原始文件，提交失败同样恢复文件和运行实例。
-	userBytes, err := user.UserBytes()
-	if err != nil {
-		return rollback(err)
-	}
-	baseBytes, err := base.Bytes()
-	if err != nil {
-		return rollback(err)
-	}
-	sb, err := settings.Bytes()
-	if err != nil {
-		return rollback(err)
-	}
-	writes := []fileWrite{{"user.yaml", userBytes}, {"subscription.yaml", baseBytes}, {"setting.yaml", sb}}
-	if err = commitFiles(m.Store, writes); err != nil {
-		return rollback(err)
-	}
-
 	return nil
+}
+
+func waitAppliedConfig(ctx context.Context, cfg *Document) error {
+	controller, err := NewController(cfg)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	tick := time.NewTicker(200 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		if _, _, err = controller.Check(ctx, cfg); err == nil {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return errors.Join(ctx.Err(), err)
+		case <-tick.C:
+		}
+	}
 }

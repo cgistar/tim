@@ -71,6 +71,9 @@ func verifyRuntime(p Process, d *Document, info RuntimeInfo) error {
 		}
 	}
 	if info.Tun.Enable {
+		if expected := d.Text("tun", "device"); expected != "" && expected != info.Tun.Device {
+			return fmt.Errorf("TUN 设备名不匹配：期望 %s，实际 %s", expected, info.Tun.Device)
+		}
 		if info.Tun.Device == "" {
 			return fmt.Errorf("TUN 未返回实际设备名")
 		}

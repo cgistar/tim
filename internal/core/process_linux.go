@@ -35,18 +35,32 @@ func detach(cmd *exec.Cmd) { cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true
 
 // 精确匹配私有运行配置和工作目录；每次发现后仍用启动时间与 pidfd 防止 PID 复用。
 func discoverProcess(config, home string) (Process, bool, error) {
+	return discoverProcesses(config, home, true)
+}
+
+// 只读状态允许 exe 不可访问；身份结果不能用于发送信号。
+func discoverProcessStatus(config, home string) (Process, bool, error) {
+	return discoverProcesses(config, home, false)
+}
+
+func discoverProcesses(config, home string, strict bool) (Process, bool, error) {
 	entries, err := os.ReadDir("/proc")
 	if err != nil {
 		return Process{}, false, err
 	}
 	var found Process
+	var permissionErr error
 	for _, entry := range entries {
 		pid, err := strconv.Atoi(entry.Name())
 		if err != nil || pid <= 1 {
 			continue
 		}
 		raw, err := os.ReadFile("/proc/" + entry.Name() + "/cmdline")
-		if errors.Is(err, os.ErrNotExist) || errors.Is(err, os.ErrPermission) {
+		if errors.Is(err, os.ErrPermission) {
+			permissionErr = err
+			continue
+		}
+		if errors.Is(err, os.ErrNotExist) {
 			continue
 		}
 		if err != nil {
@@ -56,7 +70,7 @@ func discoverProcess(config, home string) (Process, bool, error) {
 		if !processRuntimeArgs(pid, args, config, home) {
 			continue
 		}
-		start, binary, args, err := processIdentity(pid)
+		start, binary, args, err := readProcessIdentity(pid, strict)
 		if errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ESRCH) {
 			continue
 		}
@@ -71,12 +85,19 @@ func discoverProcess(config, home string) (Process, bool, error) {
 		}
 		found = Process{PID: pid, Start: start, Binary: binary, Runtime: config}
 	}
+	if !strict && found.PID == 0 && permissionErr != nil {
+		return found, false, fmt.Errorf("进程列表读取不完整: %w", permissionErr)
+	}
 	return found, found.PID != 0, nil
 }
 
 func runtimeArgs(args []string, config, home string) bool {
 	var runtimePath, directory string
 	for i := 1; i < len(args); i++ {
+		// 选项终止符后的参数属于位置参数，也可能是监督器传给子进程的命令。
+		if args[i] == "--" {
+			break
+		}
 		if args[i] == "-t" {
 			return false
 		}
@@ -94,6 +115,9 @@ func runtimeArgs(args []string, config, home string) bool {
 	return runtimePath == config && directory == home
 }
 func processIdentity(pid int) (string, string, []string, error) {
+	return readProcessIdentity(pid, true)
+}
+func readProcessIdentity(pid int, strict bool) (string, string, []string, error) {
 	b, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
 	if err != nil {
 		return "", "", nil, err
@@ -109,8 +133,17 @@ func processIdentity(pid int) (string, string, []string, error) {
 	if fields[0] == "Z" {
 		return "", "", nil, os.ErrNotExist
 	}
-	exe, err := os.Readlink(fmt.Sprintf("/proc/%d/exe", pid))
+	flags, err := strconv.ParseUint(fields[6], 10, 64)
 	if err != nil {
+		return "", "", nil, fmt.Errorf("无效 /proc stat 进程标记: %w", err)
+	}
+	// fork 后尚未 exec 的子进程沿用父进程的 exe 和参数，不能视为独立内核实例。
+	const processForkNoExec = 0x00000040
+	if flags&processForkNoExec != 0 {
+		return "", "", nil, os.ErrNotExist
+	}
+	exe, err := os.Readlink(fmt.Sprintf("/proc/%d/exe", pid))
+	if err != nil && (strict || !errors.Is(err, os.ErrPermission)) {
 		return "", "", nil, err
 	}
 	args, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))

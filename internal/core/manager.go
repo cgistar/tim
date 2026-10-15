@@ -9,36 +9,41 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strings"
+	"syscall"
 	"time"
 )
 
 type Manager struct {
-	Store *Store
-	HTTP  *http.Client
+	root     *RootSession
+	Store    *Store
+	HTTP     *http.Client
+	IPClient *http.Client
+	service  *initService
+	guard    *networkGuard
 }
 type Status struct {
 	Running               bool
+	Unknown               bool
 	PID                   int
 	Mode, Global, Message string
 	Chain                 ChainRuntime
 	Tun                   bool
 	Binary                string
+	Service               ServiceStatus
+	Guard                 GuardStatus
 }
 
 func NewManager(s *Store) *Manager {
-	return &Manager{Store: s, HTTP: &http.Client{Timeout: 2 * time.Minute}}
+	m := &Manager{Store: s, service: newServiceManager(), guard: newNetworkGuard()}
+	m.HTTP = &http.Client{Timeout: 2 * time.Minute, Transport: guardTransport{manager: m}}
+	m.IPClient = &http.Client{Timeout: 8 * time.Second}
+	return m
 }
-func (m *Manager) locked(fn func() error) error {
+func (m *Manager) withOperation(fn func() error) error {
 	if err := supported(); err != nil {
 		return err
 	}
-	unlock, err := lockFile(m.Store.Path("operation.lock"))
-	if err != nil {
-		return err
-	}
-	defer unlock()
 	settings, err := m.Store.Settings()
 	if err != nil {
 		return err
@@ -50,64 +55,84 @@ func (m *Manager) locked(fn func() error) error {
 	if configuredDir != m.Store.DataDir() {
 		return fmt.Errorf("data 目录已在其他操作中改变，请重新打开 tim")
 	}
-	if m.Store.DataDir() != m.Store.ConfigDir {
-		unlockData, err := lockFile(filepath.Join(m.Store.DataDir(), "operation.lock"))
-		if err != nil {
-			return err
-		}
-		defer unlockData()
+	if raw, spec, err := m.serviceFile(); err != nil {
+		return err
+	} else if raw != nil && (spec.Runtime != m.Store.Path("config.yaml") || spec.Home != m.Store.Path("home")) {
+		return fmt.Errorf("服务使用其他 data 目录，请使用安装时的 DATA 或已保存的 data-dir 管理")
 	}
 	return fn()
 }
 func (m *Manager) process() (Process, bool, error) {
 	return discoverProcess(m.Store.Path("config.yaml"), m.Store.Path("home"))
 }
-func (m *Manager) Status(ctx context.Context) (Status, error) {
+func (m *Manager) processContext(ctx context.Context) (Process, bool, error) {
 	p, live, err := m.process()
-	if err != nil {
-		return Status{}, err
+	if m.root == nil || !errors.Is(err, os.ErrPermission) {
+		return p, live, err
 	}
-	if !live {
-		st := Status{Message: "已停止"}
-		if raw, readErr := os.ReadFile(m.Store.Path("config.yaml")); readErr == nil {
-			d, parseErr := Parse(raw)
-			if parseErr != nil {
-				return st, parseErr
-			}
-			st.Chain = ReadChainRuntime(d)
-		} else if !errors.Is(readErr, os.ErrNotExist) {
-			return st, readErr
-		}
-		return st, nil
-	}
-	st := Status{Running: true, PID: p.PID, Binary: p.Binary}
-	b, err := os.ReadFile(m.Store.Path("config.yaml"))
-	if err != nil {
-		return st, err
-	}
-	d, err := Parse(b)
-	if err != nil {
-		return st, err
-	}
-	st.Chain = ReadChainRuntime(d)
-	c, err := NewController(d)
-	if err != nil {
-		return st, err
-	}
-	info, g, err := c.Check(ctx, d)
-	if err == nil {
-		err = verifyRuntime(p, d, info)
-	}
-	st.Mode = info.Mode
-	st.Tun = info.Tun.Enable
-	st.Global = g
-	if err != nil {
-		st.Message = "进程存在，但运行检查失败"
-		return st, err
-	}
-	st.Message = "运行中"
-	return st, nil
+	reply, err := m.rootCall(ctx, rootRequest{Action: "process"})
+	return reply.Process, reply.Live, err
 }
+func (m *Manager) Status(ctx context.Context) (status Status, result error) {
+	defer func() { status.Guard, _ = m.readNetworkGuardStatus(ctx) }()
+	svc, serviceErr := m.ServiceStatus(ctx)
+	p, live, processErr := discoverProcessStatus(m.Store.Path("config.yaml"), m.Store.Path("home"))
+	st := Status{Service: svc, Running: live, Unknown: processErr != nil, PID: p.PID, Binary: p.Binary, Message: "已停止"}
+	if st.Unknown {
+		st.Message = "进程状态未知"
+	} else if live {
+		st.Message = "进程存在，但控制接口不可用"
+	} else if svc.Active {
+		st.Message = "服务正在恢复: " + svc.State
+	} else if svc.Installed && svc.Result != "" && svc.Result != "success" {
+		st.Message = "服务失败: " + svc.Result
+	}
+	raw, err := os.ReadFile(m.Store.Path("config.yaml"))
+	if errors.Is(err, os.ErrNotExist) && !live {
+		return st, errors.Join(processErr, serviceErr)
+	}
+	if err != nil {
+		return st, errors.Join(processErr, serviceErr, err)
+	}
+	cfg, err := Parse(raw)
+	if err != nil {
+		return st, errors.Join(processErr, serviceErr, err)
+	}
+	st.Chain = ReadChainRuntime(cfg)
+	if !live && cfg.Text("external-controller") == "" {
+		return st, errors.Join(processErr, serviceErr)
+	}
+	c, err := NewController(cfg)
+	if err != nil {
+		return st, errors.Join(processErr, serviceErr, err)
+	}
+	var info RuntimeInfo
+	if err = c.Do(ctx, "GET", "/configs", nil, &info); err != nil {
+		if !live && errors.Is(err, syscall.ECONNREFUSED) {
+			return st, errors.Join(processErr, serviceErr)
+		}
+		if !live {
+			st.Unknown = true
+			st.Message = "运行状态未知"
+		}
+		return st, errors.Join(processErr, serviceErr, err)
+	}
+	// 控制接口响应即可显示实际状态；信号/配置操作仍执行严格进程核验。
+	st.Running, st.Unknown, st.Message = true, false, "运行中"
+	st.Mode, st.Tun = info.Mode, info.Tun.Enable
+	if info.Mode != "rule" && info.Mode != "global" && info.Mode != "direct" {
+		return st, errors.Join(serviceErr, fmt.Errorf("控制接口返回无效模式 %q", info.Mode))
+	}
+	if info.Mode == "global" {
+		g, err := c.Global(ctx)
+		st.Global = g.Now
+		if err != nil {
+			return st, errors.Join(serviceErr, err)
+		}
+	}
+	return st, serviceErr
+}
+
 func resolveBinary(path string) (string, error) {
 	p, err := exec.LookPath(path)
 	if err != nil {
@@ -136,7 +161,7 @@ func Version(ctx context.Context, binary string) (string, error) {
 
 // 保存只更新管理文件；应用运行配置由独立操作执行。
 func (m *Manager) SaveManagedSettings(settings Settings) error {
-	return m.locked(func() error {
+	return m.withOperation(func() error {
 		if err := settings.Validate(); err != nil {
 			return err
 		}
@@ -149,7 +174,7 @@ func (m *Manager) SaveManagedSettings(settings Settings) error {
 }
 
 func (m *Manager) ApplySettings(ctx context.Context, settings Settings) error {
-	return m.locked(func() error { return m.applySettings(ctx, settings) })
+	return m.withOperation(func() error { return m.applySettings(ctx, settings) })
 }
 func (m *Manager) applySettings(ctx context.Context, settings Settings) error {
 	if err := settings.Validate(); err != nil {
@@ -167,14 +192,7 @@ func (m *Manager) applySettings(ctx context.Context, settings Settings) error {
 		if err := store.setInitialDataDir(dir); err != nil {
 			return err
 		}
-		target = &Manager{Store: store, HTTP: m.HTTP}
-		if runtime.GOOS == "linux" && store.DataDir() != store.ConfigDir {
-			unlock, err := lockFile(filepath.Join(store.DataDir(), "operation.lock"))
-			if err != nil {
-				return err
-			}
-			defer unlock()
-		}
+		target = &Manager{Store: store, HTTP: m.HTTP, service: m.service, guard: m.guard}
 		if _, running, err := target.process(); err != nil {
 			return err
 		} else if running {
@@ -201,7 +219,7 @@ func (m *Manager) applySettings(ctx context.Context, settings Settings) error {
 	if err != nil {
 		return err
 	}
-	old, live, err := m.process()
+	_, live, err := m.managedProcess(ctx)
 	if err != nil {
 		return err
 	}
@@ -228,35 +246,12 @@ func (m *Manager) applySettings(ctx context.Context, settings Settings) error {
 			return err
 		}
 		m.Store.dataDir.Store(target.Store.DataDir())
-		return nil
+		return target.syncService(ctx, binary, target.Store.Path("config.yaml"))
 	}
-	if target == m {
-		return m.apply(ctx, base, user, settings, live)
-	}
-	if live {
-		if err = m.stop(ctx); err != nil {
-			return err
-		}
-	}
-	if err = target.apply(ctx, base, user, settings, live); err != nil {
-		if !live {
-			return err
-		}
-		restoreCtx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
-		defer cancel()
-		if stopErr := target.stop(restoreCtx); stopErr != nil {
-			return fmt.Errorf("切换 data 目录失败: %w；停止新实例失败: %v", err, stopErr)
-		}
-		if restoreErr := m.launch(restoreCtx, old.Binary, m.Store.Path("config.yaml")); restoreErr != nil {
-			return fmt.Errorf("切换 data 目录失败: %w；恢复旧实例失败: %v", err, restoreErr)
-		}
-		return fmt.Errorf("切换 data 目录失败，已恢复旧实例: %w", err)
-	}
-	m.Store.dataDir.Store(target.Store.DataDir())
-	return nil
+	return m.applyTo(ctx, target, base, user, settings)
 }
 func (m *Manager) setManaged(ctx context.Context, value any, path ...string) error {
-	return m.locked(func() error {
+	return m.withOperation(func() error {
 		settings, err := m.Store.Settings()
 		if err != nil {
 			return err
@@ -299,59 +294,59 @@ func (m *Manager) validate(ctx context.Context, binary string, d *Document) erro
 	return nil
 }
 
-// 进入界面时接管现有实例；优先使用本地订阅，避免每次启动重复下载。
-func (m *Manager) AutoStart(ctx context.Context) (string, error) {
-	st, err := m.Status(ctx)
+func (m *Manager) Start(ctx context.Context) error {
+	return m.withOperation(func() error {
+		_, err := m.start(ctx, false)
+		return err
+	})
+}
+
+// 启停只使用已保存的运行配置，不读取订阅或重新合并用户设置。
+func (m *Manager) start(ctx context.Context, restart bool) (string, error) {
+	_, live, err := m.processContext(ctx)
 	if err != nil {
 		return "", err
 	}
-	if st.Running {
-		return "内核正在运行", nil
-	}
-	_, err = m.Store.Base()
+	svc, err := m.ServiceStatus(ctx)
 	if err != nil {
-		if !errors.Is(err, os.ErrNotExist) {
+		return "", err
+	}
+	if live && svc.Installed && !svc.Active {
+		return "", fmt.Errorf("服务未运行，但发现匹配的内核进程；请先停止外部启动的内核，再执行 tim start")
+	}
+	if live && !restart {
+		return "内核正在运行", m.enableService(ctx)
+	}
+	path := m.Store.Path("config.yaml")
+	raw, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return "", fmt.Errorf("缺少 config.yaml，请先下载订阅或应用配置: %w", err)
+	}
+	if err != nil {
+		return "", err
+	}
+	if _, err = Parse(raw); err != nil {
+		return "", fmt.Errorf("读取 config.yaml 失败: %w", err)
+	}
+	binary, err := m.Store.Kernel()
+	if err != nil {
+		return "", err
+	}
+	message := "内核已启动"
+	if restart && (live || svc.Active) {
+		if err = m.stop(ctx); err != nil {
 			return "", err
 		}
-		settings, e := m.Store.Settings()
-		if e != nil {
-			return "", e
-		}
-		if settings.URL == "" {
-			return "内核已停止", nil
-		}
-		if e = m.Refresh(ctx); e != nil {
-			return "", e
-		}
+		message = "内核已重启"
 	}
-	return "内核已启动", m.Start(ctx)
+	if err = m.launch(ctx, binary, path); err != nil {
+		return "", err
+	}
+	return message, m.enableService(ctx)
 }
-func (m *Manager) Start(ctx context.Context) error {
-	return m.locked(func() error {
-		_, live, err := m.process()
-		if err != nil {
-			return err
-		}
-		if live {
-			return nil
-		}
-		u, err := m.Store.User()
-		if err != nil {
-			return err
-		}
-		b, err := m.Candidate()
-		if err != nil {
-			return err
-		}
-		s, err := m.Store.Settings()
-		if err != nil {
-			return err
-		}
-		return m.apply(ctx, b, u, s, true)
-	})
-}
+
 func (m *Manager) ToggleRunning(ctx context.Context) (string, error) {
-	_, live, err := m.process()
+	_, live, err := m.managedProcess(ctx)
 	if err != nil {
 		return "", err
 	}
@@ -361,16 +356,17 @@ func (m *Manager) ToggleRunning(ctx context.Context) (string, error) {
 	return "内核已启动", m.Start(ctx)
 }
 func (m *Manager) Restart(ctx context.Context) (string, error) {
-	return m.applyConfigured(ctx, nil, true)
+	var message string
+	err := m.withOperation(func() error {
+		var err error
+		message, err = m.start(ctx, true)
+		return err
+	})
+	return message, err
 }
 func (m *Manager) Apply(ctx context.Context, u *Document) error {
-	_, err := m.applyConfigured(ctx, u, false)
-	return err
-}
-func (m *Manager) applyConfigured(ctx context.Context, u *Document, start bool) (string, error) {
-	result := "配置已更新"
-	err := m.locked(func() error {
-		b, err := m.Candidate()
+	return m.withOperation(func() error {
+		base, err := m.Candidate()
 		if err != nil {
 			return err
 		}
@@ -380,29 +376,18 @@ func (m *Manager) applyConfigured(ctx context.Context, u *Document, start bool) 
 				return err
 			}
 		}
-		s, err := m.Store.Settings()
+		settings, err := m.Store.Settings()
 		if err != nil {
 			return err
 		}
-		_, live, err := m.process()
-		if err != nil {
-			return err
-		}
-		if start {
-			result = "内核已启动"
-			if live {
-				result = "内核已重启"
-			}
-		}
-		return m.apply(ctx, b, u, s, live || start)
+		return m.apply(ctx, base, u, settings)
 	})
-	return result, err
 }
 func (m *Manager) ToggleMode(ctx context.Context, mode string) error {
 	return m.setManaged(ctx, mode, "mode")
 }
 func (m *Manager) ToggleTun(ctx context.Context, enabled bool) error {
-	if enabled && os.Geteuid() != 0 {
+	if enabled && os.Geteuid() != 0 && m.root == nil {
 		return fmt.Errorf("TUN 管理需要 sudo/root，请以管理员身份重新运行同一个 tim 程序")
 	}
 	return m.setManaged(ctx, enabled, "tun", "enable")
@@ -413,59 +398,61 @@ type fileWrite struct {
 	data []byte
 }
 
+// 每个文件原子替换；后续步骤失败时保留已完成的写入。
 func commitFiles(s *Store, writes []fileWrite) error {
-	old := make([][]byte, len(writes))
-	exists := make([]bool, len(writes))
-	for i, w := range writes {
-		b, err := os.ReadFile(s.Path(w.name))
-		if err != nil && !errors.Is(err, os.ErrNotExist) {
-			return err
-		}
-		old[i] = b
-		exists[i] = err == nil
-	}
-	for i, w := range writes {
-		var err error
-		if w.data == nil {
-			if exists[i] {
-				err = os.Remove(s.Path(w.name))
-			}
-		} else {
-			err = AtomicWrite(s.Path(w.name), w.data, 0600)
-		}
-		if err != nil {
-			errs := []error{err}
-			for j := i - 1; j >= 0; j-- {
-				var e error
-				if exists[j] {
-					e = AtomicWrite(s.Path(writes[j].name), old[j], 0600)
-				} else {
-					e = os.Remove(s.Path(writes[j].name))
-				}
-				if e != nil {
-					errs = append(errs, e)
-				}
-			}
-			return errors.Join(errs...)
+	for _, w := range writes {
+		if err := AtomicWrite(s.Path(w.name), w.data, 0600); err != nil {
+			return fmt.Errorf("保存 %s 失败（已完成的写入保留）: %w", w.name, err)
 		}
 	}
 	return nil
 }
 func (m *Manager) Stop(ctx context.Context) error {
-	return m.locked(func() error { return m.stop(ctx) })
+	return m.withOperation(func() error {
+		raw, _, err := m.serviceFile()
+		if err != nil {
+			return err
+		}
+		if err = m.stop(ctx); err != nil {
+			return err
+		}
+		if raw != nil {
+			if _, err = m.serviceCommand(ctx, "disable", m.serviceName()); err != nil {
+				return fmt.Errorf("服务已停止，但取消开机启动失败: %w", err)
+			}
+		}
+		return nil
+	})
 }
 func (m *Manager) stop(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	p, live, err := m.process()
+	p, live, err := m.processContext(ctx)
 	if err != nil {
 		return err
+	}
+	raw, _, err := m.serviceFile()
+	if err != nil {
+		return err
+	}
+	if raw != nil {
+		if _, err = m.serviceCommand(context.WithoutCancel(ctx), "stop", m.serviceName()); err != nil {
+			return err
+		}
+		_, running, err := m.processContext(ctx)
+		if err != nil {
+			return err
+		}
+		if running {
+			return fmt.Errorf("服务已停止，但匹配内核仍在运行，拒绝继续操作")
+		}
+		return nil
 	}
 	if !live {
 		return nil
 	}
-	if err = signalManaged(p); err != nil {
+	if err = m.signalProcess(ctx, p); err != nil {
 		return err
 	}
 	// 信号已发出后完成退出等待，取消请求不能留下“旧进程正在退出”的模糊状态。
@@ -475,7 +462,7 @@ func (m *Manager) stop(ctx context.Context) error {
 	tick := time.NewTicker(100 * time.Millisecond)
 	defer tick.Stop()
 	for {
-		ok, err := matchesProcess(p)
+		ok, err := m.matchesManaged(ctx, p)
 		if err != nil {
 			return err
 		}
@@ -492,6 +479,14 @@ func (m *Manager) stop(ctx context.Context) error {
 	}
 }
 func (m *Manager) launch(ctx context.Context, binary, path string) error {
+	raw, _, err := m.serviceFile()
+	if err != nil {
+		return err
+	}
+	if raw != nil {
+		_, err = m.serviceCommand(ctx, "start", m.serviceName())
+		return err
+	}
 	b, err := os.ReadFile(path)
 	if err != nil {
 		return err
@@ -499,6 +494,21 @@ func (m *Manager) launch(ctx context.Context, binary, path string) error {
 	d, err := Parse(b)
 	if err != nil {
 		return err
+	}
+	if d.Text("tun", "enable") == "true" && os.Geteuid() != 0 {
+		if m.root != nil {
+			// 日志由界面用户创建；助手只负责启动需要 TUN 权限的内核。
+			f, e := os.OpenFile(m.Store.Path("mihomo.log"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+			if e != nil {
+				return e
+			}
+			if e = f.Close(); e != nil {
+				return e
+			}
+			_, e = m.rootCall(ctx, rootRequest{Action: "launch"})
+			return e
+		}
+		return fmt.Errorf("启用 TUN 需要 sudo/root")
 	}
 	c, err := NewController(d)
 	if err != nil {
@@ -539,7 +549,7 @@ func (m *Manager) launch(ctx context.Context, binary, path string) error {
 	defer cancel()
 	var last error
 	for {
-		ok, e := matchesProcess(p)
+		ok, e := m.matchesManaged(ctx, p)
 		if e != nil {
 			return e
 		}
@@ -548,7 +558,7 @@ func (m *Manager) launch(ctx context.Context, binary, path string) error {
 		}
 		info, _, e := c.Check(readyCtx, d)
 		if e == nil {
-			e = verifyRuntime(p, d, info)
+			e = m.verifyProcess(ctx, p, d, info)
 		}
 		if e == nil {
 			return nil

@@ -31,8 +31,19 @@ func configureForm(form *tview.Form) {
 			item.SetPlaceholderStyle(tcell.StyleDefault.Foreground(tcell.ColorGray))
 			item.SetInputCapture(formArrowNavigation)
 		case *tview.DropDown:
+			item.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+				if !item.IsOpen() {
+					return formArrowNavigation(event)
+				}
+				return event
+			})
+			item.SetTextOptions(" ", " ", "[ ", " ▾ ]", "[ 请选择 ▾ ]")
 			item.SetFocusedStyle(controlFocusStyle())
-			item.SetListStyles(tcell.StyleDefault, controlFocusStyle())
+			// 弹出列表覆盖后续字段，必须用实色背景清除底层文字。
+			item.SetListStyles(
+				tcell.StyleDefault.Foreground(tcell.ColorWhite).Background(tcell.ColorDarkSlateGray),
+				tcell.StyleDefault.Foreground(tcell.ColorBlack).Background(tcell.ColorYellow).Bold(true),
+			)
 		}
 	}
 	for i := 0; i < form.GetButtonCount(); i++ {

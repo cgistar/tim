@@ -4,7 +4,6 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
-	"runtime"
 	"sync/atomic"
 )
 
@@ -41,7 +40,7 @@ func (s *Store) Kernel() (string, error) {
 	return resolveBinary(s.ResolvePath(settings.MihomoPath))
 }
 
-// 仅文件缺失触发下载提示；权限或配置错误仍交给原错误处理。
+// 启动前仅文件缺失触发路径选择；权限或配置错误仍交给原错误处理。
 func (s *Store) KernelMissing() (bool, error) {
 	settings, err := s.Settings()
 	if err != nil {
@@ -74,13 +73,6 @@ func Open(dir string) (*Store, error) {
 		return nil, err
 	}
 	s := &Store{ConfigDir: p, DataOverride: os.Getenv("DATA")}
-	if runtime.GOOS == "linux" {
-		unlock, err := lockFile(s.Path("operation.lock"))
-		if err != nil {
-			return nil, err
-		}
-		defer unlock()
-	}
 	if err = s.initializeSettings(); err != nil {
 		return nil, err
 	}
@@ -115,8 +107,8 @@ func (s *Store) setInitialDataDir(dir string) error {
 }
 
 func (s *Store) Path(parts ...string) string {
-	// 启动配置和操作锁固定位置，切换数据目录时仍使用同一配置与锁。
-	if len(parts) == 1 && (parts[0] == "setting.yaml" || parts[0] == "operation.lock") {
+	// 启动配置固定位置，不随数据目录切换。
+	if len(parts) == 1 && parts[0] == "setting.yaml" {
 		return filepath.Join(s.ConfigDir, parts[0])
 	}
 	return filepath.Join(append([]string{s.DataDir()}, parts...)...)
@@ -174,13 +166,6 @@ func (s *Store) User() (*Document, error) {
 
 // 旧状态不再参与身份判断；清理仅限当前数据目录的已废弃文件。
 func (s *Store) removeObsoleteState() error {
-	if runtime.GOOS == "linux" && s.DataDir() != s.ConfigDir {
-		unlock, err := lockFile(filepath.Join(s.DataDir(), "operation.lock"))
-		if err != nil {
-			return err
-		}
-		defer unlock()
-	}
 	err := os.Remove(s.Path("state.json"))
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
