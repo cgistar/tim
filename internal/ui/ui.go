@@ -37,6 +37,7 @@ type screen struct {
 	networkCancel         context.CancelFunc
 	generation            uint64
 	keepDialog            bool
+	globalLoading         bool
 	menu                  *tview.List
 	manager               *core.Manager
 	busy                  bool
@@ -74,7 +75,7 @@ func newScreen(m *core.Manager) *screen {
 	s.footer = tview.NewTextView().SetDynamicColors(true).SetWrap(false)
 	s.notice = newResultView()
 	s.notice.SetBorder(true).SetTitle(" 操作日志 ")
-	s.notice.SetText("输入订阅 URL，下载后 [S 启动]。[Tab 切换焦点]，[Esc 返回]。")
+	s.notice.SetText("输入订阅 URL 或手动节点，应用后 [S 启动]。[Tab 切换焦点]，[Esc 返回]。")
 	s.menu = tview.NewList().ShowSecondaryText(true)
 	s.notice.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		if event.Key() == tcell.KeyEscape || event.Key() == tcell.KeyTab {
@@ -89,7 +90,7 @@ func newScreen(m *core.Manager) *screen {
 		label, description string
 		open               func()
 	}{
-		{'c', "订阅设置", "配置订阅 URL", s.settings},
+		{'c', "订阅设置", "订阅 URL / 手动节点（分享链接、YAML、JSON）", s.settings},
 		{'p', "基本配置", "端口 / 监听 / 延迟测试地址", s.ports},
 		{'d', "DNS 配置", "监听 / fake-ip / IPv6 / 域名嗅探 / 上游 / 过滤列表", s.dns},
 		{'a', "链式前置代理", "独立节点 YAML / 分享链接 / Base64", s.chain},
@@ -204,6 +205,9 @@ func newScreen(m *core.Manager) *screen {
 				return nil
 			case 'b':
 				s.networkGuard()
+				return nil
+			case 'g':
+				s.globalSelector()
 				return nil
 			}
 		}
@@ -408,30 +412,63 @@ func (s *screen) settings() {
 	form := tview.NewForm()
 	commit := func() {
 		snapshot := v.Clone()
+		snapshot.Nodes = strings.TrimSpace(snapshot.Nodes)
+		message := "订阅下载成功并已保存"
+		if snapshot.SourceName() == core.SourceNodes {
+			message = "手动节点订阅已生成并保存"
+		}
 		s.onSuccess = s.close
 		s.keepDialog = true
-		s.work("订阅下载成功并已保存", func(ctx context.Context) error {
-			return s.manager.RefreshURL(ctx, snapshot.URL)
+		s.work(message, func(ctx context.Context) error {
+			return s.manager.RefreshSource(ctx, snapshot)
 		})
 		s.keepDialog = false
 	}
+	sources := []string{core.SourceURL, core.SourceNodes}
+	form.AddDropDown("订阅来源", []string{"订阅 URL", "手动节点"}, slices.Index(sources, v.SourceName()), func(_ string, i int) {
+		if i >= 0 {
+			v.Source = sources[i]
+		}
+	})
 	form.AddInputField("订阅 URL", v.URL, 70, nil, func(t string) { v.URL = strings.TrimSpace(t) })
-	form.AddButton("下载 / 刷新订阅", commit)
+	// Form.AddTextArea 默认定位末尾；已有多行节点应从第一行展示。
+	area := tview.NewTextArea().SetLabel("手动节点").SetSize(12, 0).SetMaxLength(core.MaxNodesInputSize).SetText(v.Nodes, false)
+	area.SetPlaceholder("每行一个 vless:// ss:// 等分享链接，或节点 YAML/JSON：[{...}, {...}] / {...}")
+	area.SetChangedFunc(func() { v.Nodes = area.GetText() })
+	form.AddFormItem(area)
+	form.AddButton("应用", commit)
 	back := func() {
 		saved, err := s.manager.Store.Settings()
 		if err != nil {
 			s.failure(err)
 			return
 		}
-		if v.URL == saved.URL {
+		if v.SourceName() == saved.SourceName() && v.URL == saved.URL && strings.TrimSpace(v.Nodes) == strings.TrimSpace(saved.Nodes) {
 			s.close()
 			return
 		}
-		s.confirmSettings(form, "subscription-confirm", "订阅地址有修改，是否保存地址并下载订阅？", commit)
+		s.confirmSettings(form, "subscription-confirm", "订阅来源有修改，是否保存并应用订阅？", commit)
 	}
+	// 只清空草稿，保存仍走提交或返回确认，避免误清已生效的订阅。
+	form.AddButton("清除", func() {
+		form.GetFormItemByLabel("订阅 URL").(*tview.InputField).SetText("")
+		area.SetText("", false)
+		form.SetFocus(form.GetFormItemIndex("订阅 URL"))
+		if v.SourceName() == core.SourceNodes {
+			form.SetFocus(form.GetFormItemIndex("手动节点"))
+		}
+		s.app.SetFocus(form)
+	})
 	form.AddButton("返回", back)
 	form.SetCancelFunc(back)
-	form.SetBorder(true).SetTitle(" 订阅设置 · 下载前保存地址 ")
+	area.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		if event.Key() == tcell.KeyEscape {
+			back()
+			return nil
+		}
+		return event
+	})
+	form.SetBorder(true).SetTitle(" 订阅设置 · URL 或手动节点 · [Tab 切换] · [Esc 返回] ")
 	s.show(form)
 }
 
@@ -793,6 +830,9 @@ func (s *screen) renderFooter() {
 		shortcutHint("S", "启动/停止"), shortcutHint("R", "重启"),
 		shortcutHint("L", "日志"), shortcutHint("M", "模式"), shortcutHint("T", "TUN"),
 		shortcutHint("B", "断网保护"),
+	}
+	if s.last.Running && s.last.Mode == "global" {
+		items = append(items, shortcutHint("G", "切换节点"))
 	}
 	if s.latest != "" {
 		items = append(items, shortcutHint("U", "更新 "+s.latest))

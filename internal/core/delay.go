@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
-	"os"
 	"time"
 )
 
@@ -59,15 +58,7 @@ func (c *Controller) Delay(ctx context.Context, proxy, target string) (int, erro
 }
 
 func (m *Manager) ProxyDelay(ctx context.Context, proxy string) (int, error) {
-	raw, err := os.ReadFile(m.Store.Path("config.yaml"))
-	if err != nil {
-		return 0, err
-	}
-	d, err := Parse(raw)
-	if err != nil {
-		return 0, err
-	}
-	c, err := NewController(d)
+	c, err := m.runtimeController()
 	if err != nil {
 		return 0, err
 	}

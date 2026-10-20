@@ -70,7 +70,7 @@ func ParseChainInput(input string) (*Document, error) {
 		raw = strings.TrimSpace(string(decoded))
 	}
 	var d *Document
-	if scheme, _, ok := strings.Cut(raw, "://"); ok && !strings.ContainsAny(scheme, " \t\r\n:{}") {
+	if isShareLink(raw) {
 		if strings.ContainsAny(raw, "\r\n") {
 			return nil, fmt.Errorf("只能输入一个前置节点，不能导入订阅列表")
 		}
@@ -119,16 +119,24 @@ func ParseChainInput(input string) (*Document, error) {
 		}
 		d.Delete("dialer-proxy")
 	}
+	if err := normalizeProxyNode(d, "前置节点"); err != nil {
+		return nil, err
+	}
+	return d, nil
+}
+
+// 校验独立代理节点并补全名称，前置与手动订阅节点共用。
+func normalizeProxyNode(d *Document, label string) error {
 	kind := d.Text("type")
 	if n := d.Get("type"); n == nil || n.Tag != "!!str" || kind == "" {
-		return nil, fmt.Errorf("前置节点缺少 type")
+		return fmt.Errorf("%s缺少 type", label)
 	}
 	switch strings.ToLower(kind) {
 	case "direct", "reject", "reject-drop", "pass", "dns", "select", "url-test", "fallback", "load-balance", "relay":
-		return nil, fmt.Errorf("前置必须是独立代理节点，不能是策略组或内置出口")
+		return fmt.Errorf("%s必须是独立代理节点，不能是策略组或内置出口", label)
 	}
 	if n := d.Get("name"); n != nil && n.Tag != "!!str" {
-		return nil, fmt.Errorf("前置节点 name 必须为字符串")
+		return fmt.Errorf("%s name 必须为字符串", label)
 	}
 	if strings.TrimSpace(d.Text("name")) == "" {
 		name := kind
@@ -138,9 +146,14 @@ func ParseChainInput(input string) (*Document, error) {
 		_ = d.Set(name, "name")
 	}
 	if strings.IndexFunc(d.Text("name"), unicode.IsControl) >= 0 {
-		return nil, fmt.Errorf("前置节点名称不能包含控制字符")
+		return fmt.Errorf("%s名称不能包含控制字符", label)
 	}
-	return d, nil
+	return nil
+}
+
+func isShareLink(raw string) bool {
+	scheme, _, ok := strings.Cut(raw, "://")
+	return ok && !strings.ContainsAny(scheme, " \t\r\n:{}")
 }
 
 func decodeChainBase64(s string) ([]byte, error) {

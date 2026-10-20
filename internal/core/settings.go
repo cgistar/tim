@@ -8,8 +8,15 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+const (
+	SourceURL   = "url"
+	SourceNodes = "nodes"
+)
+
 type Settings struct {
 	URL        string `json:"subscription_url"`
+	Source     string
+	Nodes      string
 	FakeIP     bool
 	Config     *Document
 	Chain      ChainSettings
@@ -75,7 +82,7 @@ hosts:
 	if err = d.Set(DashboardURL, "external-ui-url"); err != nil {
 		return Settings{}, err
 	}
-	return Settings{FakeIP: true, Config: d, MihomoPath: "data/mihomo", DataDir: "data"}, nil
+	return Settings{Source: SourceURL, FakeIP: true, Config: d, MihomoPath: "data/mihomo", DataDir: "data"}, nil
 }
 
 func (s Settings) Clone() Settings {
@@ -83,7 +90,7 @@ func (s Settings) Clone() Settings {
 	return s
 }
 func (s Settings) Equal(other Settings) bool {
-	return s.DataDir == other.DataDir && s.MihomoPath == other.MihomoPath && s.URL == other.URL && s.FakeIP == other.FakeIP && s.Chain == other.Chain && s.DelayURL == other.DelayURL && equalNode(s.Config.Root.Content[0], other.Config.Root.Content[0])
+	return s.DataDir == other.DataDir && s.MihomoPath == other.MihomoPath && s.URL == other.URL && s.Source == other.Source && s.Nodes == other.Nodes && s.FakeIP == other.FakeIP && s.Chain == other.Chain && s.DelayURL == other.DelayURL && equalNode(s.Config.Root.Content[0], other.Config.Root.Content[0])
 }
 func equalNode(a, b *yaml.Node) bool {
 	if a == nil || b == nil {
@@ -113,6 +120,12 @@ func (s Settings) Bytes() ([]byte, error) {
 		return nil, err
 	}
 	if err = d.Set(s.URL, "subscription_url"); err != nil {
+		return nil, err
+	}
+	if err = d.Set(s.SourceName(), "subscription-source"); err != nil {
+		return nil, err
+	}
+	if err = d.Set(s.Nodes, "subscription-nodes"); err != nil {
 		return nil, err
 	}
 	if err = d.Set(s.FakeIP, "fake-ip-enabled"); err != nil {
@@ -169,6 +182,19 @@ func ParseSettings(raw []byte) (Settings, error) {
 			return Settings{}, err
 		}
 	}
+	// 来源字段晚于订阅地址加入，旧管理文件缺失时按 URL 来源读取。
+	s.Source = SourceURL
+	for _, field := range []struct {
+		key    string
+		target *string
+	}{{"subscription-source", &s.Source}, {"subscription-nodes", &s.Nodes}} {
+		if n := d.Get(field.key); n != nil {
+			if n.Tag != "!!str" {
+				return Settings{}, fmt.Errorf("setting.yaml.%s 必须为 !!str", field.key)
+			}
+			*field.target = n.Value
+		}
+	}
 	if n := d.Get("delay-test-url"); n != nil {
 		if n.Tag != "!!str" {
 			return Settings{}, fmt.Errorf("delay-test-url 必须为字符串")
@@ -205,10 +231,8 @@ func (s Settings) Validate() error {
 	if s.Config == nil {
 		return fmt.Errorf("setting.yaml 缺少 config")
 	}
-	if s.URL != "" {
-		if err := validateURL(s.URL); err != nil {
-			return err
-		}
+	if err := s.validateSource(); err != nil {
+		return err
 	}
 	if err := validateConfig(s.Config); err != nil {
 		return err
@@ -230,6 +254,29 @@ func (s Settings) Validate() error {
 	}
 	_, err := StringList(s.Config, "dns", "fake-ip-filter")
 	return err
+}
+
+func (s Settings) SourceName() string {
+	if s.Source == "" {
+		return SourceURL
+	}
+	return s.Source
+}
+
+// 只检查来源字段本身；节点内容在生成订阅时完整解析。
+func (s Settings) validateSource() error {
+	if s.SourceName() != SourceURL && s.SourceName() != SourceNodes {
+		return fmt.Errorf("subscription-source 仅支持 url/nodes")
+	}
+	if len(s.Nodes) > MaxNodesInputSize {
+		return fmt.Errorf("手动节点不能超过 1 MiB")
+	}
+	if s.URL != "" {
+		if err := validateURL(s.URL); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 var DNSListKeys = []string{"default-nameserver", "nameserver", "proxy-server-nameserver", "direct-nameserver"}

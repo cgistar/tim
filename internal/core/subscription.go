@@ -106,16 +106,14 @@ func (m *Manager) applyHot(ctx context.Context, base, user *Document, settings S
 
 func (m *Manager) SaveSettings(v Settings) error {
 	return m.withOperation(func() error {
-		if v.URL != "" {
-			if err := validateURL(v.URL); err != nil {
-				return err
-			}
+		if err := v.validateSource(); err != nil {
+			return err
 		}
 		current, err := m.Store.Settings()
 		if err != nil {
 			return err
 		}
-		current.URL = v.URL
+		current.Source, current.URL, current.Nodes = v.SourceName(), v.URL, v.Nodes
 		raw, err := current.Bytes()
 		if err != nil {
 			return err
@@ -133,26 +131,34 @@ func (m *Manager) Refresh(ctx context.Context) error {
 	})
 }
 
-// 地址、下载缓存与运行配置分别提交，后续失败不撤销已完成的阶段。
-func (m *Manager) RefreshURL(ctx context.Context, rawURL string) error {
+// 来源、订阅缓存与运行配置分别提交，后续失败不撤销已完成的阶段。
+func (m *Manager) RefreshSource(ctx context.Context, v Settings) error {
 	return m.withOperation(func() error {
-		if err := validateURL(rawURL); err != nil {
+		if err := v.validateSource(); err != nil {
+			return err
+		}
+		// 当前来源无效时不保存，与无效地址不写入设置保持一致。
+		if v.SourceName() == SourceNodes {
+			if _, err := ParseNodesInput(v.Nodes); err != nil {
+				return err
+			}
+		} else if err := validateURL(v.URL); err != nil {
 			return err
 		}
 		s, err := m.Store.Settings()
 		if err != nil {
 			return err
 		}
-		s.URL = rawURL
+		s.Source, s.URL, s.Nodes = v.SourceName(), v.URL, v.Nodes
 		raw, err := s.Bytes()
 		if err != nil {
 			return err
 		}
 		if err = AtomicWrite(m.Store.Path("setting.yaml"), raw, 0600); err != nil {
-			return fmt.Errorf("保存订阅地址失败: %w", err)
+			return fmt.Errorf("保存订阅来源失败: %w", err)
 		}
 		if err = m.refresh(ctx, s); err != nil {
-			return fmt.Errorf("订阅地址已保存；%w", err)
+			return fmt.Errorf("订阅来源已保存；%w", err)
 		}
 		return nil
 	})
@@ -162,11 +168,11 @@ func (m *Manager) refresh(ctx context.Context, s Settings) error {
 	return m.refreshSubscription(ctx, s, false)
 }
 func (m *Manager) refreshSubscription(ctx context.Context, s Settings, hot bool) error {
-	base, err := m.downloadSubscription(ctx, s.URL)
+	base, err := m.subscriptionBase(ctx, s)
 	if err != nil {
 		return err
 	}
-	// 缓存只依赖下载与 YAML 解析，不依赖用户覆盖、内核安装或启动结果。
+	// 缓存只依赖下载或节点解析，不依赖用户覆盖、内核安装或启动结果。
 	raw, err := base.Bytes()
 	if err != nil {
 		return err
@@ -175,9 +181,24 @@ func (m *Manager) refreshSubscription(ctx context.Context, s Settings, hot bool)
 		return fmt.Errorf("订阅已下载，但保存缓存失败: %w", err)
 	}
 	if err = m.applySubscription(ctx, base, s, hot); err != nil {
-		return fmt.Errorf("订阅下载成功并已保存；内核应用失败: %w", err)
+		stage := "订阅下载成功并已保存"
+		if s.SourceName() == SourceNodes {
+			stage = "手动节点订阅已生成并保存"
+		}
+		return fmt.Errorf("%s；内核应用失败: %w", stage, err)
 	}
 	return nil
+}
+
+func (m *Manager) subscriptionBase(ctx context.Context, s Settings) (*Document, error) {
+	if s.SourceName() != SourceNodes {
+		return m.downloadSubscription(ctx, s.URL)
+	}
+	base, err := BuildNodeSubscription(s.Nodes)
+	if err != nil {
+		return nil, fmt.Errorf("手动节点解析失败（原缓存保留）: %w", err)
+	}
+	return base, nil
 }
 
 func (m *Manager) downloadSubscription(ctx context.Context, rawURL string) (*Document, error) {
